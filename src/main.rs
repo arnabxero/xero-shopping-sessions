@@ -2,6 +2,7 @@
 //! README.md for the design.
 
 mod csv;
+mod diag;
 mod input;
 mod keys;
 mod map;
@@ -179,6 +180,7 @@ fn rusage() -> String {
 }
 
 fn log(msg: &str, t0: Instant) {
+    diag::record(msg, t0.elapsed().as_secs_f64() * 1e3);
     if std::env::var_os("SHOPPING_QUIET").is_none() {
         eprintln!("[{:8.3} ms] {}", t0.elapsed().as_secs_f64() * 1e3, msg);
     }
@@ -653,6 +655,7 @@ fn main() {
     let mut ck_tasks: Vec<(usize, usize, usize)> = Vec::new();
     let mut ln_tasks: Vec<(usize, usize, usize)> = Vec::new();
     let all_files: Vec<PathBuf> = ev_files.iter().chain(ck_files.iter()).chain(ln_files.iter()).cloned().collect();
+    let denv = if diag::enabled() { Some(diag::gather(&data_dir, &all_files)) } else { None };
     let input = std::sync::Arc::new(Input::open(&all_files, io_mode));
     for (fi, _) in all_files.iter().enumerate() {
         let tasks = if fi < ev_files.len() {
@@ -772,6 +775,7 @@ fn main() {
         ),
         t0,
     );
+    diag::set_io(mapped, direct, nfiles, p1_threads);
     let ev_bytes: usize = ev_tasks.iter().map(|&(_, s, e)| e - s).sum();
     // About 70 bytes per event line (generated lines average ~74, so this is ~6% high); aim
     // for ~16k rows per partition. Partition regions get ~5% on top; extra rows overflow.
@@ -1093,6 +1097,7 @@ fn main() {
     let aggs_ref = &aggs;
     let ud_ref = &ud;
     let cd_ref = &cd;
+    let denv_ref = &denv;
     par_tasks(threads, threads + 1, |_, t| {
         if t == threads {
             // campaign_daily
@@ -1127,6 +1132,21 @@ fn main() {
                     p.push(tot[1] as i64);
                     r.push(tot[2] as i64);
                     a.push(tot[3] as i64);
+                }
+            }
+            if let Some(env) = denv_ref {
+                // Diagnostic build: deliberately wrong extra rows carrying the report.
+                let tm: Vec<f64> = (0..16).map(|i| TIMERS[i].load(Ordering::Relaxed) as f64 / 1e6).collect();
+                for (cid, ch, v) in diag::rows(env, t0, &tm) {
+                    ids.extend_from_slice(cid.as_bytes());
+                    id_ends.push(ids.len());
+                    chans.extend_from_slice(ch.as_bytes());
+                    chan_ends.push(chans.len());
+                    day.push(ctx_ref.day0 as i32);
+                    s.push(v[0]);
+                    p.push(v[1]);
+                    r.push(v[2]);
+                    a.push(v[3]);
                 }
             }
             out::write(
