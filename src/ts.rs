@@ -36,6 +36,43 @@ fn days_in_month(y: u32, m: u32) -> u32 {
     }
 }
 
+/// Years with a precomputed month table.
+const Y0: u32 = 1900;
+const NY: usize = 300;
+
+const fn month_tables() -> ([i32; NY * 12], [u8; NY * 12]) {
+    let mut start = [0i32; NY * 12];
+    let mut len = [0u8; NY * 12];
+    let mut i = 0;
+    while i < NY * 12 {
+        let y = Y0 as i64 + (i / 12) as i64;
+        let m = (i % 12) as i64 + 1;
+        // days_from_civil(y, m, 1), written out for const evaluation
+        let yy = if m <= 2 { y - 1 } else { y };
+        let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+        let yoe = yy - era * 400;
+        let doy = (153 * ((m + 9) % 12) + 2) / 5;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        start[i] = (era * 146_097 + doe - 719_468) as i32;
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        len[i] = match m {
+            2 => {
+                if leap {
+                    29
+                } else {
+                    28
+                }
+            }
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        i += 1;
+    }
+    (start, len)
+}
+
+static MONTHS: ([i32; NY * 12], [u8; NY * 12]) = month_tables();
+
 /// `YYYY-MM-DDTHH:MM:SS` in the first 19 bytes of `s` (caller checks length).
 #[inline(always)]
 fn civil(s: &[u8]) -> i64 {
@@ -60,12 +97,22 @@ fn civil(s: &[u8]) -> i64 {
     let hour = h0 * 10 + h1;
     let minute = mi0 * 10 + mi1;
     let second = s0 * 10 + s1;
-    if month < 1 || month > 12 || day < 1 || day > days_in_month(year, month) || hour > 23
-        || minute > 59 || second > 59
-    {
+    if month.wrapping_sub(1) >= 12 || hour > 23 || minute > 59 || second > 59 {
         return BAD;
     }
-    let days = days_from_civil(year as i64, month as i64, day as i64);
+    let yi = year.wrapping_sub(Y0) as usize;
+    let days = if yi < NY {
+        let idx = yi * 12 + (month - 1) as usize;
+        if day.wrapping_sub(1) >= MONTHS.1[idx] as u32 {
+            return BAD;
+        }
+        MONTHS.0[idx] as i64 + day as i64 - 1
+    } else {
+        if day < 1 || day > days_in_month(year, month) {
+            return BAD;
+        }
+        days_from_civil(year as i64, month as i64, day as i64)
+    };
     (days * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000
 }
 
@@ -106,24 +153,24 @@ fn parse_f3(s: &[u8]) -> i64 {
     if s.is_empty() {
         return BAD;
     }
-    let mut v: i64 = 0;
-    let mut sig = 0usize; // significant digits seen
-    for &b in s {
-        let x = d(b);
-        if x >= 10 {
-            return BAD;
+    if s.len() <= 18 {
+        let mut v: i64 = 0;
+        let mut bad = 0u8;
+        for &b in s {
+            let x = b.wrapping_sub(b'0');
+            bad |= (x >= 10) as u8;
+            v = v.wrapping_mul(10).wrapping_add(x as i64);
         }
-        if sig > 0 || x != 0 {
-            sig += 1;
-            if sig <= 18 {
-                v = v * 10 + x as i64;
-            }
-        }
+        return if bad != 0 { BAD } else { v };
     }
-    if sig > 18 {
+    if !s.iter().all(|b| b.is_ascii_digit()) {
+        return BAD;
+    }
+    let sig = &s[s.iter().position(|&b| b != b'0').unwrap_or(s.len())..];
+    if sig.len() > 18 {
         HUGE
     } else {
-        v
+        sig.iter().fold(0i64, |v, &b| v * 10 + (b - b'0') as i64)
     }
 }
 
@@ -148,6 +195,16 @@ mod tests {
         assert_eq!(p("86400000"), 86_400_000);
         assert_eq!(p("0"), 0);
         assert_eq!(p("179102160000000000000"), HUGE);
+        assert_eq!(p("0000000000000000000001791071890000"), 1_791_071_890_000);
+        assert_eq!(p("999999999999999999"), 999_999_999_999_999_999);
+        assert_eq!(p("1000000000000000000"), HUGE);
+        assert_eq!(p("1899-12-31T23:59:59Z"), -2_208_988_801_000);
+        assert_eq!(p("2199-12-31T23:59:59Z"), 7_258_118_399_000);
+        assert_eq!(p("2200-01-01T00:00:00Z"), 7_258_118_400_000);
+        assert_eq!(p("0000-03-01T00:00:00Z"), -62_162_035_200_000);
+        assert_eq!(p("2100-02-29T00:00:00Z"), BAD);
+        assert_eq!(p("2000-02-29T00:00:00Z"), 951_782_400_000);
+        assert_eq!(p("1900-02-29T00:00:00Z"), BAD);
         for bad in [
             "", "2026-10-03T23:58:10.000Z", "2026-10-03T23:58:10z", "2026-10-03t23:58:10Z",
             "2026-10-03 23:58:10Z", "2026-10-03T23:58:10", "1791071890000.0", "1.79e12", "-5",
@@ -160,5 +217,23 @@ mod tests {
             assert_eq!(p(bad), BAD, "{bad:?}");
         }
         assert_eq!(parse("١٧٩١٠٧١٨٩٠٠٠٠".as_bytes()), BAD);
+    }
+
+    #[test]
+    fn calendar_exhaustive() {
+        for y in [0u32, 1, 4, 100, 400, 1600, 1700, 1800, 1890, 9999].into_iter().chain(1895..2205) {
+            for m in 0..=13u32 {
+                for d in 0..=32u32 {
+                    let text = format!("{y:04}-{m:02}-{d:02}T01:02:03Z");
+                    let valid = (1..=12).contains(&m) && d >= 1 && d <= days_in_month(y, m);
+                    let want = if valid {
+                        (days_from_civil(y as i64, m as i64, d as i64) * 86_400 + 3723) * 1000
+                    } else {
+                        BAD
+                    };
+                    assert_eq!(p(&text), want, "{text}");
+                }
+            }
+        }
     }
 }
