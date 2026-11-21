@@ -1,0 +1,23 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "shopping"
+path = "src/main.rs"
+
+[dependencies]
+memmap2 = "=0.9.12"
+mimalloc = { version = "=0.1.52", default-features = false }
+parquet = { version = "=60.1.0", default-features = false }
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
