@@ -642,7 +642,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
+        .min(24);
 
     // ---------------------------------------------------------------- inputs
     let ev_files = list_csv(&data_dir.join("events"));
@@ -653,6 +654,7 @@ fn main() {
     let io_mode = match std::env::var("SHOPPING_IO").as_deref() {
         Ok("mmap") => input::Mode::Mmap,
         Ok("pread") => input::Mode::Pread,
+        Ok("direct") => input::Mode::Direct,
         _ => input::Mode::Auto,
     };
     let mut ev_tasks: Vec<(usize, usize, usize)> = Vec::new();
@@ -760,8 +762,24 @@ fn main() {
         camp_channels,
     };
 
-    let (mapped, nfiles) = input.mapped();
-    log(&format!("setup: {} event, {} click, {} link chunks; {mapped}/{nfiles} files mapped", ev_tasks.len(), ck_tasks.len(), ln_tasks.len()), t0);
+    let (mapped, direct, nfiles) = input.counts();
+    // Workers reading uncached files wait on the disk; two per CPU keep the
+    // CPUs busy parsing while the other half waits (SHOPPING_P1X overrides).
+    let p1_threads = match std::env::var("SHOPPING_P1X").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(x) if x > 0 => threads * x,
+        _ if input.unmapped_share() > 0.5 => threads * 2,
+        _ => threads,
+    }
+    .min(31);
+    log(
+        &format!(
+            "setup: {} event, {} click, {} link chunks; files: {mapped} mapped, {direct} O_DIRECT, {nfiles} total; {p1_threads} parse workers",
+            ev_tasks.len(),
+            ck_tasks.len(),
+            ln_tasks.len()
+        ),
+        t0,
+    );
     // About 70 bytes per event line; aim for ~16k rows per partition.
     let ev_bytes: usize = ev_tasks.iter().map(|&(_, s, e)| e - s).sum();
     let est_rows = ev_bytes / 70 + 1;
@@ -776,38 +794,42 @@ fn main() {
         return;
     }
 
-    // ---------------------------------------------------------------- links
+    // ----------------------------------------- links + events + clicks (+ persons)
+    // One task queue: link chunks first, then clicks, then events. The
+    // union-find starts as soon as the last link chunk is parsed, while the
+    // workers go on with clicks and events.
     let link_out: Vec<Mutex<Vec<(u64, u64)>>> = (0..ln_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
-    par_tasks(threads, ln_tasks.len(), |_, t| {
-        let (fi, s, e) = ln_tasks[t];
-        let mut v = Vec::new();
-        let mut buf = ChunkBuf::default();
-        parse_links(input.lines(fi, s, e, &mut buf), &mut v);
-        *link_out[t].lock().unwrap() = v;
-    });
-    let link_pairs: Vec<Vec<(u64, u64)>> = link_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    log("links parsed", t0);
-
+    let links_done = AtomicUsize::new(0);
     // ------------------------------------------- events + clicks (+ persons)
     // SHOPPING_TEST_SMALLCAP=1 forces tiny partition regions so the overflow paths get tested.
     let smallcap = std::env::var_os("SHOPPING_TEST_SMALLCAP").is_some();
-    let per_part = if smallcap { 1 } else { est_rows * 13 / 10 / np / threads + 16 };
-    let ev_parts: Vec<Mutex<Option<Scatter<ERec>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
+    let per_part = if smallcap { 1 } else { est_rows * 13 / 10 / np / p1_threads + 16 };
+    let ev_parts: Vec<Mutex<Option<Scatter<ERec>>>> = (0..p1_threads).map(|_| Mutex::new(None)).collect();
     let ck_out: Vec<Mutex<Vec<CRec>>> = (0..ck_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
     let persons: Mutex<Option<U64Map<u64>>> = Mutex::new(None);
-    let ntasks = ck_tasks.len() + ev_tasks.len();
+    let nl = ln_tasks.len();
+    let ntasks = nl + ck_tasks.len() + ev_tasks.len();
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
-        s.spawn(|| {
+        let dsu = s.spawn(|| {
+            while links_done.load(Ordering::Acquire) < nl {
+                std::thread::park_timeout(std::time::Duration::from_micros(200));
+            }
+            log("links parsed", t0);
+            let link_pairs: Vec<Vec<(u64, u64)>> =
+                link_out.iter().map(|m| std::mem::take(&mut *m.lock().unwrap())).collect();
             let tm = Tm::now();
             let m = build_persons(&link_pairs);
             tadd(7, tm);
             log("persons built", t0);
             *persons.lock().unwrap() = Some(m);
         });
-        for w in 0..threads {
-            let (next, ctx, input, ev_parts, ck_out, ck_tasks, ev_tasks) =
-                (&next, &ctx, &input, &ev_parts, &ck_out, &ck_tasks, &ev_tasks);
+        let dsu_thread = dsu.thread().clone();
+        for w in 0..p1_threads {
+            let (next, ctx, input, ev_parts, ck_out, ck_tasks, ev_tasks, ln_tasks, link_out, links_done) = (
+                &next, &ctx, &input, &ev_parts, &ck_out, &ck_tasks, &ev_tasks, &ln_tasks, &link_out, &links_done,
+            );
+            let dsu_thread = dsu_thread.clone();
             s.spawn(move || {
                 let mut guard = ev_parts[w].lock().unwrap();
                 let parts = guard.insert(Scatter::new(np, per_part));
@@ -818,6 +840,17 @@ fn main() {
                         break;
                     }
                     let tm = Tm::now();
+                    if t < nl {
+                        let (fi, s, e) = ln_tasks[t];
+                        let mut v = Vec::new();
+                        parse_links(input.lines(fi, s, e, &mut buf), &mut v);
+                        *link_out[t].lock().unwrap() = v;
+                        if links_done.fetch_add(1, Ordering::AcqRel) + 1 == nl {
+                            dsu_thread.unpark();
+                        }
+                        continue;
+                    }
+                    let t = t - nl;
                     if t < ck_tasks.len() {
                         let (fi, s, e) = ck_tasks[t];
                         let mut v = Vec::with_capacity((e - s) / 40 + 16);
@@ -855,7 +888,7 @@ fn main() {
     let person_of = |user: u64| persons.get(user).unwrap_or(user);
     const WSHIFT: u32 = 26;
     const IMASK: u32 = (1 << WSHIFT) - 1;
-    assert!(2 * threads <= 63);
+    assert!(2 * p1_threads <= 63);
     par_tasks(threads, np + ck_recs.len(), |w, t| {
         let qshift = 64 - qbits();
         if t < np {
