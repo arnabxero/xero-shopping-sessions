@@ -16,13 +16,30 @@ pub fn mix(mut k: u64) -> u64 {
 pub struct U64Map<V: Copy + Default> {
     slots: Vec<(u64, V)>,
     mask: usize,
+    len: usize,
 }
 
 impl<V: Copy + Default> U64Map<V> {
-    /// Room for at least `n` keys at a load factor of at most 3/4.
+    /// Room for at least `n` keys at a load factor of at most 3/4 (the map
+    /// grows past that).
     pub fn with_capacity(n: usize) -> Self {
         let cap = (n.max(12) * 4 / 3 + 1).next_power_of_two();
-        U64Map { slots: vec![(EMPTY, V::default()); cap], mask: cap - 1 }
+        U64Map { slots: vec![(EMPTY, V::default()); cap], mask: cap - 1, len: 0 }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let old = std::mem::replace(&mut self.slots, vec![(EMPTY, V::default()); (self.mask + 1) * 2]);
+        self.mask = self.slots.len() - 1;
+        for (k, v) in old {
+            if k != EMPTY {
+                let mut i = mix(k) as usize & self.mask;
+                while self.slots[i].0 != EMPTY {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = (k, v);
+            }
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -56,8 +73,12 @@ impl<V: Copy + Default> U64Map<V> {
     }
 
     /// The slot of `k`, inserting it (with the default value) if absent.
+    /// The slot is valid until the next insertion (which may grow the map).
     #[inline(always)]
     pub fn insert_slot(&mut self, k: u64) -> usize {
+        if self.len * 4 >= self.slots.len() * 3 {
+            self.grow();
+        }
         let mut i = mix(k) as usize & self.mask;
         loop {
             let s = &mut self.slots[i];
@@ -66,6 +87,7 @@ impl<V: Copy + Default> U64Map<V> {
             }
             if s.0 == EMPTY {
                 s.0 = k;
+                self.len += 1;
                 return i;
             }
             i = (i + 1) & self.mask;

@@ -559,69 +559,57 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: u64, evs: &[u64], cks: &[PCl
 }
 
 /// Time the pieces of event parsing separately (SHOPPING_PROFILE=1).
+/// Time pieces of event parsing (SHOPPING_PROFILE=<variant>, one pass;
+/// SHOPPING_PROFILE=all runs every variant twice). Use with perf stat to get
+/// instruction counts per piece.
 fn profile(ctx: &Ctx, input: &Input, tasks: &[(usize, usize, usize)], threads: usize) {
+    let which = std::env::var("SHOPPING_PROFILE").unwrap_or_default();
     let sink = AtomicUsize::new(0);
     let run = |name: &str, f: &(dyn Fn(&[u8]) -> usize + Sync)| {
-        for _ in 0..2 {
+        if which != "all" && which != name {
+            return;
+        }
+        for _ in 0..if which == "all" { 2 } else { 1 } {
             let t = Instant::now();
             par_tasks(threads, tasks.len(), |_, i| {
                 let (fi, s, e) = tasks[i];
                 let mut buf = ChunkBuf::default();
                 sink.fetch_add(f(input.lines(fi, s, e, &mut buf)), Ordering::Relaxed);
             });
-            eprintln!("{name:>28}: {:8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            eprintln!("{name:>12}: {:8.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     };
-    run("touch bytes", &|d| d.iter().step_by(64).map(|&b| b as usize).sum());
-    run("scan rows", &|d| {
-        let mut n = 0;
-        csv::for_each_row::<7, _>(d, |_| n += 1);
-        n
-    });
-    run("scan rows (line)", &|d| {
+    run("read", &|d| d.iter().step_by(64).map(|&b| b as usize).sum());
+    run("scan", &|d| {
         let mut n = 0;
         csv::for_each_line::<7, 128, _>(d, |_| n += 1);
         n
     });
-    run("scan + 2 ts", &|d| {
+    run("scan_ingest", &|d| {
         let mut n = 0;
-        csv::for_each_line::<7, 128, _>(d, |f| n += (ts::parse(f[2]) ^ ts::parse(f[3])) as usize);
+        csv::for_each_line::<7, 128, _>(d, |f| n += ts::parse(f[3]) as usize);
         n
     });
-    run("scan + 2 keys", &|d| {
+    run("scan_ts", &|d| {
         let mut n = 0;
-        csv::for_each_row::<7, _>(d, |f| {
+        csv::for_each_line::<7, 128, _>(d, |f| n += ts::parse(f[2]) as usize);
+        n
+    });
+    run("scan_keys", &|d| {
+        let mut n = 0;
+        csv::for_each_line::<7, 128, _>(d, |f| {
+            let end = f[6].as_ptr().wrapping_add(f[6].len());
             if !f[0].is_empty() && !f[1].is_empty() {
-                n += (keys::key(f[0]) ^ keys::key(f[1])) as usize
+                n += (keys::key_bounded(f[0], end) ^ keys::key_bounded(f[1], end)) as usize
             }
         });
         n
     });
-    run("full parse, fresh bufs", &|d| {
+    run("parse", &|d| {
         let np = 1usize << pbits();
         let mut parts: Scatter<ERec> = Scatter::new(np, d.len() / 60 / np + 16);
         parse_events(ctx, d, &mut parts);
         (0..np).map(|p| parts.part_len(p)).sum()
-    });
-    run("full parse, no scatter", &|d| {
-        let mut parts: Vec<Vec<ERec>> = vec![Vec::with_capacity(d.len() / 40)];
-        let mut n = 0;
-        csv::for_each_row::<7, _>(d, |f| {
-            if f[0].is_empty() {
-                return;
-            }
-            let ingest = ts::parse(f[3]);
-            let t = ts::parse(f[2]);
-            parts[0].push(ERec {
-                eid: keys::key(f[0]),
-                ingest,
-                user: if f[1].is_empty() { 0 } else { keys::key(f[1]) },
-                ts: (t - ctx.base) as u32,
-                pc: f[4].len() as u32,
-            });
-            n += 1;
-        });
-        n + parts[0].len()
     });
     eprintln!("sink {}", sink.load(Ordering::Relaxed));
 }
@@ -902,7 +890,8 @@ fn main() {
             }
             assert!(srcs.iter().all(|v| v.len() <= IMASK as usize));
             let row = |x: u32| -> &ERec { unsafe { srcs.get_unchecked((x >> WSHIFT) as usize).get_unchecked((x & IMASK) as usize) } };
-            let cap = (2 * n).next_power_of_two();
+            // Load factor at most 3/4.
+            let cap = (n + n / 3 + 1).next_power_of_two();
             let mask = cap - 1;
             let tm = Tm::now();
             let mut table: Vec<u32> = vec![u32::MAX; cap];
@@ -997,7 +986,8 @@ fn main() {
         }
         let mut agg = aggs[w].lock().unwrap();
         let tm = Tm::now();
-        let mut lmap: U64Map<u32> = U64Map::with_capacity(n);
+        // About 30 events per person; the map grows if there are more persons.
+        let mut lmap: U64Map<u32> = U64Map::with_capacity(n / 16 + 16);
         let mut persons_l: Vec<u64> = Vec::new();
         let mut counts: Vec<u32> = Vec::new();
         let mut loc: Vec<u32> = Vec::with_capacity(n);
@@ -1026,7 +1016,9 @@ fn main() {
         }
         off.push(acc);
         let mut cur: Vec<u32> = off[..np].to_vec();
-        let mut evs: Vec<u64> = vec![0; n];
+        // Every slot is written by the counting sort below.
+        let mut evs: Vec<u64> = Vec::with_capacity(n);
+        unsafe { evs.set_len(n) };
         let mut k = 0;
         for r in pe.iter().flat_map(|v| v.part(q)).flatten() {
             {
@@ -1055,7 +1047,9 @@ fn main() {
         }
         coff.push(acc);
         let mut ccur: Vec<u32> = coff[..np + 1].to_vec();
-        let mut cks: Vec<PClick> = vec![PClick { ts: 0, camp: 0, cid: 0 }; acc as usize];
+        // Every slot is written by the counting sort below.
+        let mut cks: Vec<PClick> = Vec::with_capacity(acc as usize);
+        unsafe { cks.set_len(acc as usize) };
         let mut k = 0;
         for (_, c) in pc.iter().flat_map(|v| v.part(q)).flatten() {
             {
