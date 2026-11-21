@@ -772,12 +772,15 @@ fn main() {
         ),
         t0,
     );
-    // About 70 bytes per event line; aim for ~16k rows per partition.
     let ev_bytes: usize = ev_tasks.iter().map(|&(_, s, e)| e - s).sum();
+    // About 70 bytes per event line (generated lines average ~74, so this is ~6% high); aim
+    // for ~16k rows per partition. Partition regions get ~5% on top; extra rows overflow.
     let est_rows = ev_bytes / 70 + 1;
     let bits = ((est_rows / 16384).max(1).next_power_of_two().trailing_zeros()).clamp(8, 13) as usize;
-    PBITS.store(bits, Ordering::Relaxed);
-    QBITS.store(bits, Ordering::Relaxed);
+    // SHOPPING_PBITS / SHOPPING_QBITS override the partition counts (tuning only).
+    let env_bits = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).filter(|b| (4..=14).contains(b));
+    PBITS.store(env_bits("SHOPPING_PBITS").unwrap_or(bits), Ordering::Relaxed);
+    QBITS.store(env_bits("SHOPPING_QBITS").unwrap_or(bits), Ordering::Relaxed);
     let np = 1usize << pbits();
     let nq = 1usize << qbits();
 
@@ -795,7 +798,7 @@ fn main() {
     // ------------------------------------------- events + clicks (+ persons)
     // SHOPPING_TEST_SMALLCAP=1 forces tiny partition regions so the overflow paths get tested.
     let smallcap = std::env::var_os("SHOPPING_TEST_SMALLCAP").is_some();
-    let per_part = if smallcap { 1 } else { est_rows * 13 / 10 / np / p1_threads + 16 };
+    let per_part = if smallcap { 1 } else { est_rows * 105 / 100 / np / p1_threads + 16 };
     let ev_parts: Vec<Mutex<Option<Scatter<ERec>>>> = (0..p1_threads).map(|_| Mutex::new(None)).collect();
     let ck_out: Vec<Mutex<Vec<CRec>>> = (0..ck_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
     let persons: Mutex<Option<U64Map<u64>>> = Mutex::new(None);
@@ -872,10 +875,10 @@ fn main() {
     // ------------------------------------------------ dedup, route by person
     let ev_parts: Vec<Scatter<ERec>> = ev_parts.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
     let ck_recs: Vec<Vec<CRec>> = ck_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let per_q = if smallcap { 1 } else { est_rows * 13 / 10 / nq / threads + 16 };
+    let per_q = if smallcap { 1 } else { est_rows * 105 / 100 / nq / threads + 16 };
     let pe: Vec<Mutex<Option<Scatter<PRec>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
     let n_clicks: usize = ck_recs.iter().map(|v| v.len()).sum();
-    let per_qc = if smallcap { 1 } else { n_clicks * 13 / 10 / nq / threads + 16 };
+    let per_qc = if smallcap { 1 } else { n_clicks * 11 / 10 / nq / threads + 16 };
     let pc: Vec<Mutex<Option<Scatter<(u64, PClick)>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
     let person_of = |user: u64| persons.get(user).unwrap_or(user);
     const WSHIFT: u32 = 26;
