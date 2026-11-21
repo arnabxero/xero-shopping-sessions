@@ -301,14 +301,18 @@ fn open_one(path: &Path, mode: Mode) -> Option<InFile> {
     if len == 0 {
         return None;
     }
+    // Auto: mostly cached -> mmap; partly cached -> buffered reads (they use
+    // the cached pages); mostly uncached or unknown -> O_DIRECT.
+    #[cfg(target_os = "linux")]
+    let share = if mode == Mode::Auto { cached_share(&file, len) } else { None };
+    #[cfg(not(target_os = "linux"))]
+    let share: Option<f64> = Some(1.0);
     let use_map = match mode {
         Mode::Mmap => true,
         Mode::Pread | Mode::Direct => false,
-        #[cfg(target_os = "linux")]
-        Mode::Auto => cached_share(&file, len).map_or(false, |c| c >= 0.9),
-        #[cfg(not(target_os = "linux"))]
-        Mode::Auto => true,
+        Mode::Auto => share.map_or(false, |c| c >= 0.9),
     };
+    let partial = mode == Mode::Auto && share.map_or(false, |c| c >= 0.1);
     let map = if use_map {
         let m = unsafe { Mmap::map(&file).ok()? };
         #[cfg(unix)]
@@ -317,7 +321,7 @@ fn open_one(path: &Path, mode: Mode) -> Option<InFile> {
     } else {
         None
     };
-    let direct = if map.is_none() && mode != Mode::Pread { open_direct(path) } else { None };
+    let direct = if map.is_none() && mode != Mode::Pread && !partial { open_direct(path) } else { None };
     Some(InFile { file: Some(file), direct, len, map })
 }
 

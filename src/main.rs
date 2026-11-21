@@ -291,7 +291,9 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
         if ingest == ts::BAD {
             return;
         }
-        let eid = keys::key(f[0]);
+        // Readable bytes end at the line end at the latest (the last field's end).
+        let end = f[6].as_ptr().wrapping_add(f[6].len());
+        let eid = keys::key_bounded(f[0], end);
         let mut rec = ERec { eid, ingest, user: 0, ts: 0, pc: INVALID };
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
@@ -312,7 +314,7 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
                 }
                 _ => break 'v,
             };
-            rec.user = keys::key(f[1]);
+            rec.user = keys::key_bounded(f[1], end);
             rec.ts = (t - base) as u32;
             rec.pc = pc;
         }
@@ -331,7 +333,8 @@ fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
             return;
         }
         let Some(camp) = ctx.campaign(f[2]) else { return };
-        out.push(CRec { user: keys::key(f[1]), cid: keys::key(f[0]), ts: (t - base) as u32, camp });
+        let end = f[3].as_ptr().wrapping_add(f[3].len());
+        out.push(CRec { user: keys::key_bounded(f[1], end), cid: keys::key_bounded(f[0], end), ts: (t - base) as u32, camp });
     });
 }
 

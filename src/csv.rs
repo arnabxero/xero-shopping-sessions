@@ -174,31 +174,35 @@ pub fn for_each_line<const N: usize, const W: usize, F: FnMut(&[&[u8]; N])>(data
         }
         let ll = nl.trailing_zeros() as usize;
         let below = (1u128 << ll) - 1;
-        let mut commas = cm & below;
+        let commas = cm & below;
         if commas.count_ones() as usize == N - 1 {
-            // Field k spans [s, e) relative to the line. It is quoted when the
-            // quote mask has bits at s and e - 1 and it is at least 2 long;
-            // the line is well-formed when those are all its quotes.
+            // Field k spans [s, e) of the line. It is quoted when it is at
+            // least 2 long and starts and ends with a quote; the line is
+            // well-formed when those are all its quotes.
             let q = qt & below;
+            let (mut clo, mut chi) = (commas as u64, (commas >> 64) as u64);
             let mut fields: [&[u8]; N] = [&[]; N];
             let mut quoted = 0u32;
-            let mut s = 0usize;
+            let mut s = pos;
             for (k, fl) in fields.iter_mut().enumerate() {
                 let e = if k + 1 < N {
-                    let c = commas.trailing_zeros() as usize;
-                    commas &= commas - 1;
-                    c
+                    if clo != 0 {
+                        let c = clo.trailing_zeros() as usize;
+                        clo &= clo - 1;
+                        pos + c
+                    } else {
+                        let c = chi.trailing_zeros() as usize;
+                        chi &= chi - 1;
+                        pos + 64 + c
+                    }
                 } else {
-                    ll
+                    pos + ll
                 };
                 let flen = e - s;
-                let qs = (q >> s) as u32 & 1;
-                let qe = (q >> (e.wrapping_sub(1) & 127)) as u32 & 1;
-                let isq = qs & qe & ((flen >= 2) as u32);
-                quoted += isq;
-                *fl = unsafe {
-                    std::slice::from_raw_parts(base.add(pos + s + isq as usize), flen - 2 * isq as usize)
-                };
+                let (first, last) = unsafe { (*base.add(s), *base.add(s + flen.max(1) - 1)) };
+                let isq = ((flen >= 2) & (first == b'"') & (last == b'"')) as usize;
+                quoted += isq as u32;
+                *fl = unsafe { std::slice::from_raw_parts(base.add(s + isq), flen - 2 * isq) };
                 s = e + 1;
             }
             if q.count_ones() == 2 * quoted {

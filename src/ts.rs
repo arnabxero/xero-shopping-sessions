@@ -215,9 +215,38 @@ pub fn parse(s: &[u8]) -> i64 {
     parse_f3(s)
 }
 
+/// The value of 8 ASCII digits (first digit in the lowest byte), or None.
+#[inline(always)]
+fn swar8(chunk: u64) -> Option<u64> {
+    if !swar_digits(chunk, u64::MAX) {
+        return None;
+    }
+    let mut v = chunk - 0x3030_3030_3030_3030;
+    v = v * 10 + (v >> 8);
+    v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
+        + ((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32)))
+        >> 32;
+    Some(v)
+}
+
+const POW10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
 /// F3: one or more ASCII digits.
 #[inline]
 fn parse_f3(s: &[u8]) -> i64 {
+    let n = s.len();
+    if (9..=16).contains(&n) {
+        // The first 8 digits, then the last n - 8 (the overlap replaced by '0').
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(s[n - 8..n].try_into().unwrap());
+        let r = n - 8;
+        let keep = if r == 8 { u64::MAX } else { !((1u64 << (8 * (8 - r))) - 1) };
+        let b = (b & keep) | (0x3030_3030_3030_3030 & !keep);
+        return match (swar8(a), swar8(b)) {
+            (Some(x), Some(y)) => (x * POW10[r] + y) as i64,
+            _ => BAD,
+        };
+    }
     if s.is_empty() {
         return BAD;
     }
@@ -285,6 +314,39 @@ mod tests {
             assert_eq!(p(bad), BAD, "{bad:?}");
         }
         assert_eq!(parse("١٧٩١٠٧١٨٩٠٠٠٠".as_bytes()), BAD);
+    }
+
+    #[test]
+    fn f3_matches_simple() {
+        let simple = |s: &[u8]| -> i64 {
+            if s.is_empty() || !s.iter().all(|b| b.is_ascii_digit()) {
+                return BAD;
+            }
+            let sig = &s[s.iter().position(|&b| b != b'0').unwrap_or(s.len())..];
+            if sig.len() > 18 {
+                return HUGE;
+            }
+            sig.iter().fold(0i64, |v, &b| v * 10 + (b - b'0') as i64)
+        };
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..400_000 {
+            let n = (rnd() % 24) as usize;
+            let mut s: Vec<u8> = (0..n).map(|_| b'0' + (rnd() % 10) as u8).collect();
+            if round % 3 == 0 && n > 0 {
+                let i = (rnd() % n as u64) as usize;
+                s[i] = (rnd() % 256) as u8;
+            }
+            if s.len() == 20 && s[19] == b'Z' || s.len() == 25 {
+                continue;
+            }
+            assert_eq!(parse(&s), simple(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
     }
 
     #[test]
