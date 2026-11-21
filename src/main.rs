@@ -5,6 +5,7 @@ mod csv;
 mod keys;
 mod map;
 mod out;
+mod scatter;
 mod ts;
 
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use std::time::Instant;
 use memmap2::Mmap;
 
 use map::{mix, U64Map};
+use scatter::Scatter;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -29,11 +31,20 @@ const LATE: i64 = 86_400_000;
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = 0x00FF_FFFF;
 
-/// Dedup partitions (by event_id) and person partitions.
-const PBITS: u32 = 10;
-const QBITS: u32 = 10;
-const NP: usize = 1 << PBITS;
-const NQ: usize = 1 << QBITS;
+/// Bits of the partition counts (by event_id for dedup, by person for
+/// sessions), chosen from the input size so partitions stay cache-sized.
+static PBITS: AtomicUsize = AtomicUsize::new(10);
+static QBITS: AtomicUsize = AtomicUsize::new(10);
+
+#[inline(always)]
+fn pbits() -> u32 {
+    PBITS.load(Ordering::Relaxed) as u32
+}
+
+#[inline(always)]
+fn qbits() -> u32 {
+    QBITS.load(Ordering::Relaxed) as u32
+}
 
 const CHUNK: usize = 4 << 20;
 
@@ -115,6 +126,56 @@ impl Ctx {
             None => self.camp_other.get(id).copied(),
         }
     }
+}
+
+static TIMERS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// CPU time of the calling thread in ns (wall time where unsupported).
+#[inline(always)]
+fn cpu_now() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+        return ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+    }
+    #[allow(unreachable_code)]
+    {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Tm(u64);
+
+impl Tm {
+    #[inline(always)]
+    fn now() -> Tm {
+        Tm(cpu_now())
+    }
+}
+
+#[inline(always)]
+fn tadd(i: usize, t: Tm) {
+    TIMERS[i].fetch_add(cpu_now().wrapping_sub(t.0), Ordering::Relaxed);
+}
+
+fn rusage() -> String {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut r: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut r);
+        return format!(
+            "cpu user {:.0} ms sys {:.0} ms, minflt {} majflt {}",
+            r.ru_utime.tv_sec as f64 * 1e3 + r.ru_utime.tv_usec as f64 / 1e3,
+            r.ru_stime.tv_sec as f64 * 1e3 + r.ru_stime.tv_usec as f64 / 1e3,
+            r.ru_minflt,
+            r.ru_majflt
+        );
+    }
+    #[allow(unreachable_code)]
+    String::new()
 }
 
 fn log(msg: &str, t0: Instant) {
@@ -238,8 +299,9 @@ fn parse_price(s: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut [Vec<ERec>]) {
+fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
+    let shift = 64 - pbits();
     csv::for_each_row::<7, _>(data, |f| {
         if f[0].is_empty() {
             return;
@@ -273,7 +335,7 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut [Vec<ERec>]) {
             rec.ts = (t - base) as u32;
             rec.pc = pc;
         }
-        parts[(mix(eid) >> (64 - PBITS)) as usize].push(rec);
+        parts.push((mix(eid) >> shift) as usize, rec);
     });
 }
 
@@ -546,9 +608,10 @@ fn profile(ctx: &Ctx, maps: &[Mmap], tasks: &[(usize, usize, usize)], threads: u
         n
     });
     run("full parse, fresh bufs", &|d| {
-        let mut parts: Vec<Vec<ERec>> = (0..NP).map(|_| Vec::new()).collect();
+        let np = 1usize << pbits();
+        let mut parts: Scatter<ERec> = Scatter::new(np, d.len() / 60 / np + 16);
         parse_events(ctx, d, &mut parts);
-        parts.iter().map(|p| p.len()).sum()
+        (0..np).map(|p| parts.part_len(p)).sum()
     });
     run("full parse, no scatter", &|d| {
         let mut parts: Vec<Vec<ERec>> = vec![Vec::with_capacity(d.len() / 40)];
@@ -575,6 +638,10 @@ fn profile(ctx: &Ctx, maps: &[Mmap], tasks: &[(usize, usize, usize)], threads: u
 
 fn main() {
     let t0 = Instant::now();
+    // Keep freed memory mapped for reuse: purging (MADV_DONTNEED) makes the
+    // kernel zero the pages again when the next phase touches them.
+    // 15 = mi_option_purge_delay in mimalloc v2's mimalloc.h; -1 = never purge.
+    unsafe { libmimalloc_sys::mi_option_set(15, -1) };
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
         (PathBuf::from(&args[args.len() - 2]), PathBuf::from(&args[args.len() - 1]))
@@ -684,6 +751,14 @@ fn main() {
         }
     }
     log(&format!("setup: {} event, {} click, {} link chunks", ev_tasks.len(), ck_tasks.len(), ln_tasks.len()), t0);
+    // About 70 bytes per event line; aim for ~16k rows per partition.
+    let ev_bytes: usize = ev_tasks.iter().map(|&(_, s, e)| e - s).sum();
+    let est_rows = ev_bytes / 70 + 1;
+    let bits = ((est_rows / 16384).max(1).next_power_of_two().trailing_zeros()).clamp(8, 13) as usize;
+    PBITS.store(bits, Ordering::Relaxed);
+    QBITS.store(bits, Ordering::Relaxed);
+    let np = 1usize << pbits();
+    let nq = 1usize << qbits();
 
     if std::env::var_os("SHOPPING_PROFILE").is_some() {
         profile(&ctx, &maps, &ev_tasks, threads);
@@ -702,15 +777,19 @@ fn main() {
     log("links parsed", t0);
 
     // ------------------------------------------- events + clicks (+ persons)
-    let ev_parts: Vec<Mutex<Vec<Vec<ERec>>>> =
-        (0..threads).map(|_| Mutex::new((0..NP).map(|_| Vec::new()).collect())).collect();
+    // SHOPPING_TEST_SMALLCAP=1 forces tiny partition regions so the overflow paths get tested.
+    let smallcap = std::env::var_os("SHOPPING_TEST_SMALLCAP").is_some();
+    let per_part = if smallcap { 1 } else { est_rows * 13 / 10 / np / threads + 16 };
+    let ev_parts: Vec<Mutex<Option<Scatter<ERec>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
     let ck_out: Vec<Mutex<Vec<CRec>>> = (0..ck_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
     let persons: Mutex<Option<U64Map<u64>>> = Mutex::new(None);
     let ntasks = ck_tasks.len() + ev_tasks.len();
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         s.spawn(|| {
+            let tm = Tm::now();
             let m = build_persons(&link_pairs);
+            tadd(7, tm);
             log("persons built", t0);
             *persons.lock().unwrap() = Some(m);
         });
@@ -718,20 +797,24 @@ fn main() {
             let (next, ctx, maps, ev_parts, ck_out, ck_tasks, ev_tasks) =
                 (&next, &ctx, &maps, &ev_parts, &ck_out, &ck_tasks, &ev_tasks);
             s.spawn(move || {
-                let mut parts = ev_parts[w].lock().unwrap();
+                let mut guard = ev_parts[w].lock().unwrap();
+                let parts = guard.insert(Scatter::new(np, per_part));
                 loop {
                     let t = next.fetch_add(1, Ordering::Relaxed);
                     if t >= ntasks {
                         break;
                     }
+                    let tm = Tm::now();
                     if t < ck_tasks.len() {
                         let (fi, s, e) = ck_tasks[t];
-                        let mut v = Vec::new();
+                        let mut v = Vec::with_capacity((e - s) / 40 + 16);
                         parse_clicks(ctx, &maps[fi][s..e], &mut v);
                         *ck_out[t].lock().unwrap() = v;
+                        tadd(6, tm);
                     } else {
                         let (fi, s, e) = ev_tasks[t - ck_tasks.len()];
-                        parse_events(ctx, &maps[fi][s..e], &mut parts);
+                        parse_events(ctx, &maps[fi][s..e], parts);
+                        tadd(5, tm);
                     }
                 }
             });
@@ -740,99 +823,130 @@ fn main() {
     let persons = persons.into_inner().unwrap().unwrap();
     keys::freeze();
     log("events/clicks parsed, persons built", t0);
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        eprintln!("phase1 thread-ms: events {:.0} clicks {:.0} persons {:.0}",
+            TIMERS[5].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[6].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[7].load(Ordering::Relaxed) as f64 / 1e6);
+    }
 
     // ------------------------------------------------ dedup, route by person
-    let ev_parts: Vec<Vec<Vec<ERec>>> = ev_parts.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let ev_parts: Vec<Scatter<ERec>> = ev_parts.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
     let ck_recs: Vec<Vec<CRec>> = ck_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let pe: Vec<Mutex<Vec<Vec<PRec>>>> =
-        (0..threads).map(|_| Mutex::new((0..NQ).map(|_| Vec::new()).collect())).collect();
-    let pc: Vec<Mutex<Vec<Vec<(u64, PClick)>>>> =
-        (0..threads).map(|_| Mutex::new((0..NQ).map(|_| Vec::new()).collect())).collect();
+    let per_q = if smallcap { 1 } else { est_rows * 13 / 10 / nq / threads + 16 };
+    let pe: Vec<Mutex<Option<Scatter<PRec>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
+    let n_clicks: usize = ck_recs.iter().map(|v| v.len()).sum();
+    let per_qc = if smallcap { 1 } else { n_clicks * 13 / 10 / nq / threads + 16 };
+    let pc: Vec<Mutex<Option<Scatter<(u64, PClick)>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
     let person_of = |user: u64| persons.get(user).unwrap_or(user);
-    par_tasks(threads, NP + ck_recs.len(), |w, t| {
-        if t < NP {
-            let n: usize = ev_parts.iter().map(|v| v[t].len()).sum();
+    const WSHIFT: u32 = 26;
+    const IMASK: u32 = (1 << WSHIFT) - 1;
+    assert!(2 * threads <= 63);
+    par_tasks(threads, np + ck_recs.len(), |w, t| {
+        let qshift = 64 - qbits();
+        if t < np {
+            let srcs: Vec<&[ERec]> = ev_parts.iter().flat_map(|v| v.part(t)).collect();
+            let n: usize = srcs.iter().map(|v| v.len()).sum();
             if n == 0 {
                 return;
             }
-            let mut rows: Vec<ERec> = Vec::with_capacity(n);
-            for v in &ev_parts {
-                rows.extend_from_slice(&v[t]);
-            }
+            assert!(srcs.iter().all(|v| v.len() <= IMASK as usize));
+            let row = |x: u32| -> &ERec { unsafe { srcs.get_unchecked((x >> WSHIFT) as usize).get_unchecked((x & IMASK) as usize) } };
             let cap = (2 * n).next_power_of_two();
             let mask = cap - 1;
+            let tm = Tm::now();
             let mut table: Vec<u32> = vec![u32::MAX; cap];
-            for (i, r) in rows.iter().enumerate() {
-                let mut s = mix(r.eid) as usize & mask;
-                loop {
-                    let x = table[s];
-                    if x == u32::MAX {
-                        table[s] = i as u32;
-                        break;
-                    }
-                    let o = &rows[x as usize];
-                    if o.eid == r.eid {
-                        if r.ingest < o.ingest {
-                            table[s] = i as u32;
+            for (wi, src) in srcs.iter().enumerate() {
+                for (i, r) in src.iter().enumerate() {
+                    let id = ((wi as u32) << WSHIFT) | i as u32;
+                    let mut s = mix(r.eid) as usize & mask;
+                    loop {
+                        let x = table[s];
+                        if x == u32::MAX {
+                            table[s] = id;
+                            break;
                         }
-                        break;
+                        let o = row(x);
+                        if o.eid == r.eid {
+                            if r.ingest < o.ingest {
+                                table[s] = id;
+                            }
+                            break;
+                        }
+                        s = (s + 1) & mask;
                     }
-                    s = (s + 1) & mask;
                 }
             }
-            let mut out = pe[w].lock().unwrap();
+            tadd(0, tm);
+            let tm = Tm::now();
             let mut win: Vec<u32> = Vec::with_capacity(n);
             for &x in &table {
-                if x != u32::MAX && rows[x as usize].pc != INVALID {
+                if x != u32::MAX && row(x).pc != INVALID {
                     win.push(x);
                 }
             }
+            tadd(8, tm);
+            let tm = Tm::now();
             const AHEAD: usize = 24;
+            let mut pers: Vec<u64> = Vec::with_capacity(win.len());
             for (i, &x) in win.iter().enumerate() {
                 if let Some(&y) = win.get(i + AHEAD) {
-                    persons.prefetch(rows[y as usize].user);
+                    persons.prefetch(row(y).user);
                 }
-                let r = &rows[x as usize];
-                let person = person_of(r.user);
-                out[(mix(person) >> (64 - QBITS)) as usize]
-                    .push(PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
+                pers.push(person_of(row(x).user));
             }
+            tadd(9, tm);
+            let tm = Tm::now();
+            let mut guard = pe[w].lock().unwrap();
+            let out = guard.get_or_insert_with(|| Scatter::new(nq, per_q));
+            for (i, &x) in win.iter().enumerate() {
+                let r = row(x);
+                let person = pers[i];
+                let q = (mix(person) >> qshift) as usize;
+                out.push(q, PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
+            }
+            tadd(1, tm);
         } else {
-            let mut out = pc[w].lock().unwrap();
-            let cr = &ck_recs[t - NP];
+            let tm = Tm::now();
+            let mut guard = pc[w].lock().unwrap();
+            let out = guard.get_or_insert_with(|| Scatter::new(nq, per_qc));
+            let cr = &ck_recs[t - np];
             for (i, c) in cr.iter().enumerate() {
                 if let Some(y) = cr.get(i + 24) {
                     persons.prefetch(y.user);
                 }
                 let person = person_of(c.user);
-                out[(mix(person) >> (64 - QBITS)) as usize]
-                    .push((person, PClick { ts: c.ts, camp: c.camp, cid: c.cid }));
+                out.push((mix(person) >> qshift) as usize, (person, PClick { ts: c.ts, camp: c.camp, cid: c.cid }));
             }
+            tadd(2, tm);
         }
     });
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        let g = |i: usize| TIMERS[i].load(Ordering::Relaxed) as f64 / 1e6;
+        eprintln!("phase2 thread-ms: dedup {:.0} collect {:.0} lookup {:.0} scatter {:.0} clicks {:.0}", g(0), g(8), g(9), g(1), g(2));
+    }
     drop(ev_parts);
     drop(ck_recs);
     log("dedup + routing done", t0);
 
     // ------------------------------------- sessionize, attribute, aggregate
-    let pe: Vec<Vec<Vec<PRec>>> = pe.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let pc: Vec<Vec<Vec<(u64, PClick)>>> = pc.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let pe: Vec<Scatter<PRec>> = pe.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
+    let pc: Vec<Scatter<(u64, PClick)>> = pc.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
     let mut order: Vec<(usize, usize)> =
-        (0..NQ).map(|q| (pe.iter().map(|v| v[q].len()).sum::<usize>(), q)).collect();
+        (0..nq).map(|q| (pe.iter().map(|v| v.part_len(q)).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let aggs: Vec<Mutex<Agg>> = (0..threads).map(|_| Mutex::new(Agg::new(&ctx))).collect();
-    par_tasks(threads, NQ, |w, t| {
+    par_tasks(threads, nq, |w, t| {
         let (n, q) = order[t];
         if n == 0 {
             return;
         }
         let mut agg = aggs[w].lock().unwrap();
+        let tm = Tm::now();
         let mut lmap: U64Map<u32> = U64Map::with_capacity(n);
         let mut persons_l: Vec<u64> = Vec::new();
         let mut counts: Vec<u32> = Vec::new();
         let mut loc: Vec<u32> = Vec::with_capacity(n);
-        for v in &pe {
-            for r in &v[q] {
+        for r in pe.iter().flat_map(|v| v.part(q)).flatten() {
+            {
                 let s = lmap.insert_slot(r.person);
                 let l = if lmap.val_at(s) == 0 {
                     persons_l.push(r.person);
@@ -858,8 +972,8 @@ fn main() {
         let mut cur: Vec<u32> = off[..np].to_vec();
         let mut evs: Vec<u64> = vec![0; n];
         let mut k = 0;
-        for v in &pe {
-            for r in &v[q] {
+        for r in pe.iter().flat_map(|v| v.part(q)).flatten() {
+            {
                 let l = loc[k] as usize;
                 evs[cur[l] as usize] = r.tspc;
                 cur[l] += 1;
@@ -869,8 +983,8 @@ fn main() {
         // clicks of persons with events
         let mut ccounts: Vec<u32> = vec![0; np + 1];
         let mut cloc: Vec<u32> = Vec::new();
-        for v in &pc {
-            for (person, _) in &v[q] {
+        for (person, _) in pc.iter().flat_map(|v| v.part(q)).flatten() {
+            {
                 let l = lmap.get(*person).unwrap_or(0);
                 cloc.push(l);
                 ccounts[l as usize] += 1;
@@ -887,14 +1001,16 @@ fn main() {
         let mut ccur: Vec<u32> = coff[..np + 1].to_vec();
         let mut cks: Vec<PClick> = vec![PClick { ts: 0, camp: 0, cid: 0 }; acc as usize];
         let mut k = 0;
-        for v in &pc {
-            for (_, c) in &v[q] {
+        for (_, c) in pc.iter().flat_map(|v| v.part(q)).flatten() {
+            {
                 let l = cloc[k] as usize;
                 cks[ccur[l] as usize] = *c;
                 ccur[l] += 1;
                 k += 1;
             }
         }
+        tadd(3, tm);
+        let tm = Tm::now();
         for l in 0..np {
             let e = &mut evs[off[l] as usize..off[l + 1] as usize];
             e.sort_unstable();
@@ -902,7 +1018,12 @@ fn main() {
             c.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.cid, b.cid)));
             process_person(&ctx, &mut agg, persons_l[l], e, c);
         }
+        tadd(4, tm);
     });
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        eprintln!("phase3 thread-ms: group {:.0} sort+process {:.0}",
+            TIMERS[3].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[4].load(Ordering::Relaxed) as f64 / 1e6);
+    }
     log("sessions done", t0);
 
     // ---------------------------------------------------------------- output
@@ -1012,5 +1133,17 @@ fn main() {
         }
     });
     log("output written", t0);
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        eprintln!("{}", rusage());
+        for f in ["/proc/self/status", "/proc/self/smaps_rollup"] {
+            if let Ok(text) = std::fs::read_to_string(f) {
+                for l in text.lines() {
+                    if l.starts_with("VmHWM") || l.starts_with("VmRSS") || l.starts_with("AnonHugePages") || l.starts_with("Rss") {
+                        eprintln!("{f}: {l}");
+                    }
+                }
+            }
+        }
+    }
     let _ = keys::any_fallback();
 }

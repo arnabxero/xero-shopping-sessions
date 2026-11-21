@@ -19,9 +19,9 @@ pub struct U64Map<V: Copy + Default> {
 }
 
 impl<V: Copy + Default> U64Map<V> {
-    /// Room for at least `n` keys at a load factor of at most 1/2.
+    /// Room for at least `n` keys at a load factor of at most 3/4.
     pub fn with_capacity(n: usize) -> Self {
-        let cap = (n.max(8) * 2).next_power_of_two();
+        let cap = (n.max(12) * 4 / 3 + 1).next_power_of_two();
         U64Map { slots: vec![(EMPTY, V::default()); cap], mask: cap - 1 }
     }
 
