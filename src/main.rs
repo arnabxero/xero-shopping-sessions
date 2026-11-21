@@ -992,8 +992,11 @@ fn main() {
         let mut persons_l: Vec<u64> = Vec::new();
         let mut counts: Vec<u32> = Vec::new();
         let mut loc: Vec<u32> = Vec::with_capacity(n);
-        for r in pe.iter().flat_map(|v| v.part(q)).flatten() {
-            {
+        // The partition's rows: plain slices, walked with simple nested loops.
+        let eparts: Vec<&[PRec]> = pe.iter().flat_map(|v| v.part(q)).collect();
+        let cparts: Vec<&[(u64, PClick)]> = pc.iter().flat_map(|v| v.part(q)).collect();
+        for part in &eparts {
+            for r in part.iter() {
                 let s = lmap.insert_slot(r.person);
                 let l = if lmap.val_at(s) == 0 {
                     persons_l.push(r.person);
@@ -1021,8 +1024,8 @@ fn main() {
         let mut evs: Vec<u64> = Vec::with_capacity(n);
         unsafe { evs.set_len(n) };
         let mut k = 0;
-        for r in pe.iter().flat_map(|v| v.part(q)).flatten() {
-            {
+        for part in &eparts {
+            for r in part.iter() {
                 let l = loc[k] as usize;
                 evs[cur[l] as usize] = r.tspc;
                 cur[l] += 1;
@@ -1032,8 +1035,8 @@ fn main() {
         // clicks of persons with events
         let mut ccounts: Vec<u32> = vec![0; np + 1];
         let mut cloc: Vec<u32> = Vec::new();
-        for (person, _) in pc.iter().flat_map(|v| v.part(q)).flatten() {
-            {
+        for part in &cparts {
+            for (person, _) in part.iter() {
                 let l = lmap.get(*person).unwrap_or(0);
                 cloc.push(l);
                 ccounts[l as usize] += 1;
@@ -1052,8 +1055,8 @@ fn main() {
         let mut cks: Vec<PClick> = Vec::with_capacity(acc as usize);
         unsafe { cks.set_len(acc as usize) };
         let mut k = 0;
-        for (_, c) in pc.iter().flat_map(|v| v.part(q)).flatten() {
-            {
+        for part in &cparts {
+            for (_, c) in part.iter() {
                 let l = cloc[k] as usize;
                 cks[ccur[l] as usize] = *c;
                 ccur[l] += 1;
