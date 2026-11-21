@@ -103,15 +103,6 @@ pub fn key(s: &[u8]) -> u64 {
     }
 }
 
-/// The key of `s` if it was already seen (packed keys always exist).
-pub fn lookup_key(s: &[u8]) -> Option<u64> {
-    if let Some(k) = pack(s) {
-        return Some(k);
-    }
-    let guard = INTERNER.lock().unwrap();
-    guard.as_ref().and_then(|it| it.map.get(s).copied())
-}
-
 /// Copy the interned strings into a lock-free-to-read snapshot. Call after
 /// every key has been created and before `cmp`/`decode` run in hot loops.
 pub fn freeze() {

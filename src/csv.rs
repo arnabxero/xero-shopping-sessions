@@ -176,30 +176,33 @@ pub fn for_each_line<const N: usize, const W: usize, F: FnMut(&[&[u8]; N])>(data
         let below = (1u128 << ll) - 1;
         let mut commas = cm & below;
         if commas.count_ones() as usize == N - 1 {
-            let mut fields: [&[u8]; N] = [&[]; N];
-            let mut start = pos;
-            for fl in fields.iter_mut().take(N - 1) {
-                let c = pos + commas.trailing_zeros() as usize;
-                commas &= commas - 1;
-                *fl = unsafe { std::slice::from_raw_parts(base.add(start), c - start) };
-                start = c + 1;
-            }
-            fields[N - 1] = unsafe { std::slice::from_raw_parts(base.add(start), pos + ll - start) };
+            // Field k spans [s, e) relative to the line. It is quoted when the
+            // quote mask has bits at s and e - 1 and it is at least 2 long;
+            // the line is well-formed when those are all its quotes.
             let q = qt & below;
-            if q == 0 {
+            let mut fields: [&[u8]; N] = [&[]; N];
+            let mut quoted = 0u32;
+            let mut s = 0usize;
+            for (k, fl) in fields.iter_mut().enumerate() {
+                let e = if k + 1 < N {
+                    let c = commas.trailing_zeros() as usize;
+                    commas &= commas - 1;
+                    c
+                } else {
+                    ll
+                };
+                let flen = e - s;
+                let qs = (q >> s) as u32 & 1;
+                let qe = (q >> (e.wrapping_sub(1) & 127)) as u32 & 1;
+                let isq = qs & qe & ((flen >= 2) as u32);
+                quoted += isq;
+                *fl = unsafe {
+                    std::slice::from_raw_parts(base.add(pos + s + isq as usize), flen - 2 * isq as usize)
+                };
+                s = e + 1;
+            }
+            if q.count_ones() == 2 * quoted {
                 f(&fields);
-            } else {
-                let mut quoted = 0u32;
-                for fl in fields.iter_mut() {
-                    let l = fl.len();
-                    if l >= 2 && fl[0] == b'"' && fl[l - 1] == b'"' {
-                        quoted += 1;
-                        *fl = &fl[1..l - 1];
-                    }
-                }
-                if q.count_ones() == 2 * quoted {
-                    f(&fields);
-                }
             }
         }
         pos += ll + 1;
