@@ -240,14 +240,13 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut [Vec<ERec>]) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
-    for line in csv::Lines::new(data) {
-        let Some(f) = csv::split::<7>(line) else { continue };
+    csv::for_each_row::<7, _>(data, |f| {
         if f[0].is_empty() {
-            continue;
+            return;
         }
         let ingest = ts::parse(f[3]);
         if ingest == ts::BAD {
-            continue;
+            return;
         }
         let eid = keys::key(f[0]);
         let mut rec = ERec { eid, ingest, user: 0, ts: 0, pc: INVALID };
@@ -275,33 +274,31 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut [Vec<ERec>]) {
             rec.pc = pc;
         }
         parts[(mix(eid) >> (64 - PBITS)) as usize].push(rec);
-    }
+    });
 }
 
 fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
     let (base, we) = (ctx.base, ctx.we);
-    for line in csv::Lines::new(data) {
-        let Some(f) = csv::split::<4>(line) else { continue };
+    csv::for_each_row::<4, _>(data, |f| {
         if f[0].is_empty() || f[1].is_empty() {
-            continue;
+            return;
         }
         let t = ts::parse(f[3]);
         if t < base || t >= we {
-            continue;
+            return;
         }
-        let Some(camp) = ctx.campaign(f[2]) else { continue };
+        let Some(camp) = ctx.campaign(f[2]) else { return };
         out.push(CRec { user: keys::key(f[1]), cid: keys::key(f[0]), ts: (t - base) as u32, camp });
-    }
+    });
 }
 
 fn parse_links(data: &[u8], out: &mut Vec<(u64, u64)>) {
-    for line in csv::Lines::new(data) {
-        let Some(f) = csv::split::<2>(line) else { continue };
+    csv::for_each_row::<2, _>(data, |f| {
         if f[0].is_empty() || f[1].is_empty() {
-            continue;
+            return;
         }
         out.push((keys::key(f[0]), keys::key(f[1])));
-    }
+    });
 }
 
 /// Union-find over linked IDs. Returns a map from every linked ID to its
@@ -309,8 +306,34 @@ fn parse_links(data: &[u8], out: &mut Vec<(u64, u64)>) {
 fn build_persons(pairs: &[Vec<(u64, u64)>]) -> U64Map<u64> {
     let n: usize = pairs.iter().map(|v| v.len()).sum();
     let mut m: U64Map<u64> = U64Map::with_capacity(2 * n);
-    let cap = m.capacity();
-    let mut parent: Vec<u32> = vec![u32::MAX; cap];
+    // Dense indices for the IDs, in first-seen order; map values are index + 1.
+    let mut keys_d: Vec<u64> = Vec::with_capacity(2 * n);
+    let mut pairs_d: Vec<(u32, u32)> = Vec::with_capacity(n);
+    const AHEAD: usize = 16;
+    for v in pairs {
+        for (i, &(a, b)) in v.iter().enumerate() {
+            if let Some(&(pa, pb)) = v.get(i + AHEAD) {
+                m.prefetch(pa);
+                m.prefetch(pb);
+            }
+            let mut dense = |k: u64| -> u32 {
+                let s = m.insert_slot(k);
+                let x = m.val_at(s);
+                if x != 0 {
+                    (x - 1) as u32
+                } else {
+                    keys_d.push(k);
+                    m.set_val_at(s, keys_d.len() as u64);
+                    (keys_d.len() - 1) as u32
+                }
+            };
+            let da = dense(a);
+            let db = dense(b);
+            pairs_d.push((da, db));
+        }
+    }
+    let nd = keys_d.len();
+    let mut parent: Vec<u32> = (0..nd as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
             let gp = p[p[x as usize] as usize];
@@ -319,33 +342,27 @@ fn build_persons(pairs: &[Vec<(u64, u64)>]) -> U64Map<u64> {
         }
         x
     }
-    for v in pairs {
-        for &(a, b) in v {
-            let sa = m.insert_slot(a) as u32;
-            let sb = m.insert_slot(b) as u32;
-            if parent[sa as usize] == u32::MAX {
-                parent[sa as usize] = sa;
-            }
-            if parent[sb as usize] == u32::MAX {
-                parent[sb as usize] = sb;
-            }
-            let ra = find(&mut parent, sa);
-            let rb = find(&mut parent, sb);
-            if ra != rb {
-                // The root always holds the smallest key of its component.
-                if keys::cmp(m.key_at(ra as usize), m.key_at(rb as usize)).is_lt() {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
+    for &(a, b) in &pairs_d {
+        let ra = find(&mut parent, a);
+        let rb = find(&mut parent, b);
+        if ra != rb {
+            // The root always holds the smallest key of its component.
+            if keys::cmp(keys_d[ra as usize], keys_d[rb as usize]).is_lt() {
+                parent[rb as usize] = ra;
+            } else {
+                parent[ra as usize] = rb;
             }
         }
     }
-    for s in 0..cap {
-        if parent[s] != u32::MAX {
-            let r = find(&mut parent, s as u32);
-            let name = m.key_at(r as usize);
-            m.set_val_at(s, name);
+    let mut name: Vec<u64> = vec![0; nd];
+    for d in 0..nd {
+        let r = find(&mut parent, d as u32);
+        name[d] = keys_d[r as usize];
+    }
+    for s in 0..m.capacity() {
+        if m.key_at(s) != map::EMPTY {
+            let d = (m.val_at(s) - 1) as usize;
+            m.set_val_at(s, name[d]);
         }
     }
     m
@@ -495,6 +512,67 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: u64, evs: &[u64], cks: &[PCl
     agg.active.clear();
 }
 
+/// Time the pieces of event parsing separately (SHOPPING_PROFILE=1).
+fn profile(ctx: &Ctx, maps: &[Mmap], tasks: &[(usize, usize, usize)], threads: usize) {
+    let sink = AtomicUsize::new(0);
+    let run = |name: &str, f: &(dyn Fn(&[u8]) -> usize + Sync)| {
+        for _ in 0..2 {
+            let t = Instant::now();
+            par_tasks(threads, tasks.len(), |_, i| {
+                let (fi, s, e) = tasks[i];
+                sink.fetch_add(f(&maps[fi][s..e]), Ordering::Relaxed);
+            });
+            eprintln!("{name:>28}: {:8.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+    };
+    run("touch bytes", &|d| d.iter().step_by(64).map(|&b| b as usize).sum());
+    run("scan rows", &|d| {
+        let mut n = 0;
+        csv::for_each_row::<7, _>(d, |_| n += 1);
+        n
+    });
+    run("scan + 2 ts", &|d| {
+        let mut n = 0;
+        csv::for_each_row::<7, _>(d, |f| n += (ts::parse(f[2]) ^ ts::parse(f[3])) as usize);
+        n
+    });
+    run("scan + 2 keys", &|d| {
+        let mut n = 0;
+        csv::for_each_row::<7, _>(d, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                n += (keys::key(f[0]) ^ keys::key(f[1])) as usize
+            }
+        });
+        n
+    });
+    run("full parse, fresh bufs", &|d| {
+        let mut parts: Vec<Vec<ERec>> = (0..NP).map(|_| Vec::new()).collect();
+        parse_events(ctx, d, &mut parts);
+        parts.iter().map(|p| p.len()).sum()
+    });
+    run("full parse, no scatter", &|d| {
+        let mut parts: Vec<Vec<ERec>> = vec![Vec::with_capacity(d.len() / 40)];
+        let mut n = 0;
+        csv::for_each_row::<7, _>(d, |f| {
+            if f[0].is_empty() {
+                return;
+            }
+            let ingest = ts::parse(f[3]);
+            let t = ts::parse(f[2]);
+            parts[0].push(ERec {
+                eid: keys::key(f[0]),
+                ingest,
+                user: if f[1].is_empty() { 0 } else { keys::key(f[1]) },
+                ts: (t - ctx.base) as u32,
+                pc: f[4].len() as u32,
+            });
+            n += 1;
+        });
+        n + parts[0].len()
+    });
+    eprintln!("sink {}", sink.load(Ordering::Relaxed));
+}
+
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -607,6 +685,11 @@ fn main() {
     }
     log(&format!("setup: {} event, {} click, {} link chunks", ev_tasks.len(), ck_tasks.len(), ln_tasks.len()), t0);
 
+    if std::env::var_os("SHOPPING_PROFILE").is_some() {
+        profile(&ctx, &maps, &ev_tasks, threads);
+        return;
+    }
+
     // ---------------------------------------------------------------- links
     let link_out: Vec<Mutex<Vec<(u64, u64)>>> = (0..ln_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
     par_tasks(threads, ln_tasks.len(), |_, t| {
@@ -628,6 +711,7 @@ fn main() {
     std::thread::scope(|s| {
         s.spawn(|| {
             let m = build_persons(&link_pairs);
+            log("persons built", t0);
             *persons.lock().unwrap() = Some(m);
         });
         for w in 0..threads {
@@ -697,19 +781,29 @@ fn main() {
                 }
             }
             let mut out = pe[w].lock().unwrap();
+            let mut win: Vec<u32> = Vec::with_capacity(n);
             for &x in &table {
-                if x != u32::MAX {
-                    let r = &rows[x as usize];
-                    if r.pc != INVALID {
-                        let person = person_of(r.user);
-                        out[(mix(person) >> (64 - QBITS)) as usize]
-                            .push(PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
-                    }
+                if x != u32::MAX && rows[x as usize].pc != INVALID {
+                    win.push(x);
                 }
+            }
+            const AHEAD: usize = 24;
+            for (i, &x) in win.iter().enumerate() {
+                if let Some(&y) = win.get(i + AHEAD) {
+                    persons.prefetch(rows[y as usize].user);
+                }
+                let r = &rows[x as usize];
+                let person = person_of(r.user);
+                out[(mix(person) >> (64 - QBITS)) as usize]
+                    .push(PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
             }
         } else {
             let mut out = pc[w].lock().unwrap();
-            for c in &ck_recs[t - NP] {
+            let cr = &ck_recs[t - NP];
+            for (i, c) in cr.iter().enumerate() {
+                if let Some(y) = cr.get(i + 24) {
+                    persons.prefetch(y.user);
+                }
                 let person = person_of(c.user);
                 out[(mix(person) >> (64 - QBITS)) as usize]
                     .push((person, PClick { ts: c.ts, camp: c.camp, cid: c.cid }));

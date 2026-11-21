@@ -29,6 +29,17 @@ impl<V: Copy + Default> U64Map<V> {
         self.slots.len()
     }
 
+    /// Hint the cache line holding the first probe slot of `k`.
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        let i = mix(k) as usize & self.mask;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+        }
+    }
+
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<V> {
         let mut i = mix(k) as usize & self.mask;

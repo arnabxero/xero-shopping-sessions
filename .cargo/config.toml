@@ -1,0 +1,4 @@
+# x86-64-v3 (AVX2, BMI2, FMA, LZCNT, MOVBE) runs on the scorers' Cascade Lake
+# Xeons and on our AVX2-only dev machines, so the tested binary is the scored one.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
