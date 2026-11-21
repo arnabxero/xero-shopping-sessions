@@ -302,7 +302,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     let shift = 64 - pbits();
-    csv::for_each_row::<7, _>(data, |f| {
+    csv::for_each_line::<7, 128, _>(data, |f| {
         if f[0].is_empty() {
             return;
         }
@@ -341,7 +341,7 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
 
 fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
     let (base, we) = (ctx.base, ctx.we);
-    csv::for_each_row::<4, _>(data, |f| {
+    csv::for_each_line::<4, 64, _>(data, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -355,7 +355,7 @@ fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
 }
 
 fn parse_links(data: &[u8], out: &mut Vec<(u64, u64)>) {
-    csv::for_each_row::<2, _>(data, |f| {
+    csv::for_each_line::<2, 64, _>(data, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -593,9 +593,14 @@ fn profile(ctx: &Ctx, maps: &[Mmap], tasks: &[(usize, usize, usize)], threads: u
         csv::for_each_row::<7, _>(d, |_| n += 1);
         n
     });
+    run("scan rows (line)", &|d| {
+        let mut n = 0;
+        csv::for_each_line::<7, 128, _>(d, |_| n += 1);
+        n
+    });
     run("scan + 2 ts", &|d| {
         let mut n = 0;
-        csv::for_each_row::<7, _>(d, |f| n += (ts::parse(f[2]) ^ ts::parse(f[3])) as usize);
+        csv::for_each_line::<7, 128, _>(d, |f| n += (ts::parse(f[2]) ^ ts::parse(f[3])) as usize);
         n
     });
     run("scan + 2 keys", &|d| {

@@ -111,6 +111,108 @@ fn block_masks(p: &[u8; 64]) -> (u64, u64, u64) {
     (n, c, q)
 }
 
+/// Bitmasks of `\n`, `,` and `"` in the `W` (64 or 128) bytes at `p`.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn window_masks<const W: usize>(p: *const u8) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    let v0 = _mm256_loadu_si256(p as *const __m256i);
+    let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let (v2, v3) = if W > 64 {
+        (_mm256_loadu_si256(p.add(64) as *const __m256i), _mm256_loadu_si256(p.add(96) as *const __m256i))
+    } else {
+        (_mm256_setzero_si256(), _mm256_setzero_si256())
+    };
+    let m = |c: u8| -> u128 {
+        let s = _mm256_set1_epi8(c as i8);
+        let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, s)) as u32 as u64;
+        let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, s)) as u32 as u64;
+        let lo = (a | (b << 32)) as u128;
+        if W > 64 {
+            let c2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, s)) as u32 as u64;
+            let d = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v3, s)) as u32 as u64;
+            lo | (((c2 | (d << 32)) as u128) << 64)
+        } else {
+            lo
+        }
+    };
+    (m(b'\n'), m(b','), m(b'"'))
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn window_masks<const W: usize>(p: *const u8) -> (u128, u128, u128) {
+    let (mut n, mut c, mut q) = (0u128, 0u128, 0u128);
+    for i in 0..W {
+        let b = *p.add(i);
+        n |= ((b == b'\n') as u128) << i;
+        c |= ((b == b',') as u128) << i;
+        q |= ((b == b'"') as u128) << i;
+    }
+    (n, c, q)
+}
+
+/// Call `f` with the `N` unquoted fields of every well-formed line of `data`
+/// (same dialect as `Lines` + `split`). Line at a time: one window of `W`
+/// bytes (64 or 128) gives the line's newline, comma and quote bitmasks.
+/// Lines longer than the window, and the last lines of `data`, take the
+/// simple path.
+#[inline(always)]
+pub fn for_each_line<const N: usize, const W: usize, F: FnMut(&[&[u8]; N])>(data: &[u8], mut f: F) {
+    let len = data.len();
+    let base = data.as_ptr();
+    let mut pos = 0usize;
+    while pos + W <= len {
+        let (nl, cm, qt) = unsafe { window_masks::<W>(base.add(pos)) };
+        if nl == 0 {
+            let end = memchr_nl(&data[pos..]).map_or(len, |i| pos + i);
+            if let Some(fields) = split::<N>(&data[pos..end]) {
+                f(&fields);
+            }
+            pos = end + 1;
+            continue;
+        }
+        let ll = nl.trailing_zeros() as usize;
+        let below = (1u128 << ll) - 1;
+        let mut commas = cm & below;
+        if commas.count_ones() as usize == N - 1 {
+            let mut fields: [&[u8]; N] = [&[]; N];
+            let mut start = pos;
+            for fl in fields.iter_mut().take(N - 1) {
+                let c = pos + commas.trailing_zeros() as usize;
+                commas &= commas - 1;
+                *fl = unsafe { std::slice::from_raw_parts(base.add(start), c - start) };
+                start = c + 1;
+            }
+            fields[N - 1] = unsafe { std::slice::from_raw_parts(base.add(start), pos + ll - start) };
+            let q = qt & below;
+            if q == 0 {
+                f(&fields);
+            } else {
+                let mut quoted = 0u32;
+                for fl in fields.iter_mut() {
+                    let l = fl.len();
+                    if l >= 2 && fl[0] == b'"' && fl[l - 1] == b'"' {
+                        quoted += 1;
+                        *fl = &fl[1..l - 1];
+                    }
+                }
+                if q.count_ones() == 2 * quoted {
+                    f(&fields);
+                }
+            }
+        }
+        pos += ll + 1;
+    }
+    if pos < len {
+        for line in Lines::new(&data[pos..]) {
+            if let Some(fields) = split::<N>(line) {
+                f(&fields);
+            }
+        }
+    }
+}
+
 /// Call `f` with the `N` unquoted fields of every well-formed line of `data`
 /// (same dialect as `Lines` + `split`, in one SIMD pass).
 #[inline(always)]
@@ -226,6 +328,12 @@ mod tests {
         v
     }
 
+    fn line<const N: usize, const W: usize>(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        for_each_line::<N, W, _>(data, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        v
+    }
+
     #[test]
     fn simd_matches_simple() {
         let mut seed = 0x1234_5678_9abc_def0u64;
@@ -236,7 +344,7 @@ mod tests {
             seed
         };
         let alphabet = b"ab,,,\"\"\n\r x";
-        for round in 0..20000 {
+        for round in 0..60000 {
             let len = (rnd() % 300) as usize;
             let mut data: Vec<u8> = (0..len).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect();
             if round % 3 == 0 {
@@ -252,7 +360,8 @@ mod tests {
                         if q {
                             data.push(b'"');
                         }
-                        for _ in 0..(rnd() % 12) {
+                        let flen = if round % 2 == 0 { rnd() % 40 } else { rnd() % 12 };
+                        for _ in 0..flen {
                             data.push(b"abc12 \r"[(rnd() % 7) as usize]);
                         }
                         if q && rnd() % 10 != 0 {
@@ -267,6 +376,10 @@ mod tests {
             assert_eq!(slow::<2>(&data), fast::<2>(&data), "{:?}", String::from_utf8_lossy(&data));
             assert_eq!(slow::<4>(&data), fast::<4>(&data), "{:?}", String::from_utf8_lossy(&data));
             assert_eq!(slow::<7>(&data), fast::<7>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(slow::<2>(&data), line::<2, 64>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(slow::<4>(&data), line::<4, 64>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(slow::<7>(&data), line::<7, 128>(&data), "{:?}", String::from_utf8_lossy(&data));
+            assert_eq!(slow::<4>(&data), line::<4, 128>(&data), "{:?}", String::from_utf8_lossy(&data));
         }
     }
 }

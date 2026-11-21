@@ -117,12 +117,80 @@ fn civil(s: &[u8]) -> i64 {
 }
 
 /// Parse a timestamp to epoch milliseconds; BAD if it is not F1/F2/F3.
-#[inline]
+/// True if every byte selected by `m` is an ASCII digit.
+#[inline(always)]
+fn swar_digits(x: u64, m: u64) -> bool {
+    let d = x & m;
+    let hi = 0xF0F0_F0F0_F0F0_F0F0 & m;
+    let three = 0x3030_3030_3030_3030 & m;
+    // High nibble 3, and low nibble <= 9 (adding 6 must not reach the high nibble).
+    (d & hi) == three && (d.wrapping_add(0x0606_0606_0606_0606 & m) & hi) == three
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` (exactly 20 bytes, caller checks), branch-light.
+#[inline(always)]
+fn f1(s: &[u8]) -> i64 {
+    let lo = u64::from_le_bytes(s[0..8].try_into().unwrap()); // YYYY-MM-
+    let mid = u64::from_le_bytes(s[8..16].try_into().unwrap()); // DDTHH:MM
+    let hi = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64; // :SSZ
+    const LO_SEP_M: u64 = 0xFF00_00FF_0000_0000;
+    const LO_SEP: u64 = 0x2D00_002D_0000_0000; // '-' at 4 and 7
+    const MID_SEP_M: u64 = 0x0000_FF00_00FF_0000;
+    const MID_SEP: u64 = 0x0000_3A00_0054_0000; // 'T' at 2, ':' at 5
+    const HI_SEP_M: u64 = 0xFF00_00FF;
+    const HI_SEP: u64 = 0x5A00_003A; // ':' at 0, 'Z' at 3
+    const LO_D: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const MID_D: u64 = 0xFFFF_00FF_FF00_FFFF;
+    const HI_D: u64 = 0x00FF_FF00;
+    let ok = (lo & LO_SEP_M) == LO_SEP
+        && (mid & MID_SEP_M) == MID_SEP
+        && (hi & HI_SEP_M) == HI_SEP
+        && swar_digits(lo, LO_D)
+        && swar_digits(mid, MID_D)
+        && swar_digits(hi, HI_D);
+    if !ok {
+        return BAD;
+    }
+    const Z: u64 = 0x3030_3030_3030_3030;
+    let dl = (lo & LO_D) - (Z & LO_D);
+    let dm = (mid & MID_D) - (Z & MID_D);
+    let dh = (hi & HI_D) - (Z & HI_D);
+    // Byte i of t is 10 * digit_i + digit_(i+1) (no carries: each is <= 99).
+    let tl = dl * 10 + (dl >> 8);
+    let tm = dm * 10 + (dm >> 8);
+    let th = dh * 10 + (dh >> 8);
+    let byte = |t: u64, i: u32| ((t >> (8 * i)) & 0xFF) as u32;
+    let year = byte(tl, 0) * 100 + byte(tl, 2);
+    let month = byte(tl, 5);
+    let day = byte(tm, 0);
+    let hour = byte(tm, 3);
+    let minute = byte(tm, 6);
+    let second = byte(th, 1);
+    if month.wrapping_sub(1) >= 12 || hour > 23 || minute > 59 || second > 59 {
+        return BAD;
+    }
+    let yi = year.wrapping_sub(Y0) as usize;
+    let days = if yi < NY {
+        let idx = yi * 12 + (month - 1) as usize;
+        if day.wrapping_sub(1) >= MONTHS.1[idx] as u32 {
+            return BAD;
+        }
+        MONTHS.0[idx] as i64 + day as i64 - 1
+    } else {
+        if day < 1 || day > days_in_month(year, month) {
+            return BAD;
+        }
+        days_from_civil(year as i64, month as i64, day as i64)
+    };
+    (days * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000
+}
+
+#[inline(always)]
 pub fn parse(s: &[u8]) -> i64 {
     let n = s.len();
     if n == 20 {
         if s[19] == b'Z' {
-            return civil(s);
+            return f1(s);
         }
     } else if n == 25 {
         let sign = s[19];
@@ -235,5 +303,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn f1_swar_matches_scalar() {
+        for base in ["2026-10-03T23:58:10Z", "2028-02-29T00:00:00Z", "1999-12-31T23:59:59Z", "2027-02-28T12:34:56Z"] {
+            let b = base.as_bytes();
+            for i in 0..19 {
+                for v in 0..=255u8 {
+                    let mut t = b.to_vec();
+                    t[i] = v;
+                    assert_eq!(parse(&t), civil(&t), "{:?}", String::from_utf8_lossy(&t));
+                }
+            }
+            // two digits changed at once
+            for i in 0..19 {
+                for j in 0..19 {
+                    for v in [b'0', b'9', b'3', b'/', b':'] {
+                        let mut t = b.to_vec();
+                        t[i] = v;
+                        t[j] = b'0' + ((i + j) % 10) as u8;
+                        assert_eq!(parse(&t), civil(&t), "{:?}", String::from_utf8_lossy(&t));
+                    }
+                }
+            }
+        }
+        assert_eq!(p("00000001791071890000"), 1_791_071_890_000);
+        assert_eq!(p("0000000000001791071890000"), 1_791_071_890_000);
     }
 }
