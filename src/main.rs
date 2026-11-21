@@ -46,7 +46,7 @@ fn qbits() -> u32 {
     QBITS.load(Ordering::Relaxed) as u32
 }
 
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 2 << 20;
 
 /// One parsed event line, routed by the hash of its event_id.
 #[derive(Clone, Copy, Default)]
@@ -666,6 +666,9 @@ fn main() {
         chunks(input.len(fi), &mut cs);
         tasks.extend(cs.into_iter().map(|(s, e)| (fi, s, e)));
     }
+    // Largest chunks first, so the short file tails even out the end of the
+    // parse phase (processing order does not change any result).
+    ev_tasks.sort_by_key(|&(_, s, e)| std::cmp::Reverse(e - s));
     // Start reading every input range now, in the order the parsers will
     // want it, so the device queue stays full (cold page cache) while the
     // small files are read and the parsers run.
