@@ -894,8 +894,8 @@ fn main() {
             }
             assert!(srcs.iter().all(|v| v.len() <= IMASK as usize));
             let row = |x: u32| -> &ERec { unsafe { srcs.get_unchecked((x >> WSHIFT) as usize).get_unchecked((x & IMASK) as usize) } };
-            // Load factor at most 3/4.
-            let cap = (n + n / 3 + 1).next_power_of_two();
+            // Load factor at most 1/2: each probe may touch a random row.
+            let cap = (2 * n).next_power_of_two();
             let mask = cap - 1;
             let tm = Tm::now();
             let mut table: Vec<u32> = vec![u32::MAX; cap];
