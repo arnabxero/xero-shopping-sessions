@@ -6,6 +6,7 @@ mod input;
 mod keys;
 mod map;
 mod out;
+mod pq;
 mod scatter;
 mod ts;
 
@@ -46,7 +47,7 @@ fn qbits() -> u32 {
     QBITS.load(Ordering::Relaxed) as u32
 }
 
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 2 << 20;
 
 /// One parsed event line, routed by the hash of its event_id.
 #[derive(Clone, Copy, Default)]
@@ -666,6 +667,9 @@ fn main() {
         chunks(input.len(fi), &mut cs);
         tasks.extend(cs.into_iter().map(|(s, e)| (fi, s, e)));
     }
+    // Largest chunks first, so the short file tails even out the end of the
+    // parse phase (processing order does not change any result).
+    ev_tasks.sort_by_key(|&(_, s, e)| std::cmp::Reverse(e - s));
     // Start reading every input range now, in the order the parsers will
     // want it, so the device queue stays full (cold page cache) while the
     // small files are read and the parsers run.
@@ -1155,20 +1159,40 @@ fn main() {
                     a.push(tot[3] as i64);
                 }
             }
-            out::write(
-                &cd_ref.join("part-0.parquet"),
-                out::CAMPAIGN_SCHEMA,
-                vec![
-                    out::Col::Str(ids, id_ends),
-                    out::Col::Str(chans, chan_ends),
-                    out::Col::I32(day),
-                    out::Col::I64(s),
-                    out::Col::I64(p),
-                    out::Col::I64(r),
-                    out::Col::I64(a),
-                ],
-            )
-            .expect("write campaign_daily");
+            let path = cd_ref.join("part-0.parquet");
+            if std::env::var("SHOPPING_PARQUET").as_deref() == Ok("crate") {
+                out::write(
+                    &path,
+                    out::CAMPAIGN_SCHEMA,
+                    vec![
+                        out::Col::Str(ids, id_ends),
+                        out::Col::Str(chans, chan_ends),
+                        out::Col::I32(day),
+                        out::Col::I64(s),
+                        out::Col::I64(p),
+                        out::Col::I64(r),
+                        out::Col::I64(a),
+                    ],
+                )
+                .expect("write campaign_daily");
+            } else {
+                let n = day.len();
+                pq::write(
+                    &path,
+                    &["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"],
+                    &[
+                        pq::Col::Str(&ids, &id_ends),
+                        pq::Col::Str(&chans, &chan_ends),
+                        pq::Col::Date(&day),
+                        pq::Col::I64(&s),
+                        pq::Col::I64(&p),
+                        pq::Col::I64(&r),
+                        pq::Col::I64(&a),
+                    ],
+                    n,
+                )
+                .expect("write campaign_daily");
+            }
         } else {
             let rows = &aggs_ref[t].urows;
             if rows.is_empty() && t != 0 {
@@ -1200,19 +1224,38 @@ fn main() {
                     defs.push(0i16);
                 }
             }
-            out::write(
-                &ud_ref.join(format!("part-{t}.parquet")),
-                out::USER_SCHEMA,
-                vec![
-                    out::Col::Str(names, name_ends),
-                    out::Col::I32(day),
-                    out::Col::I64(s),
-                    out::Col::I64(e),
-                    out::Col::I64(r),
-                    out::Col::OptStr(cats, cat_ends, defs),
-                ],
-            )
-            .expect("write user_daily");
+            let path = ud_ref.join(format!("part-{t}.parquet"));
+            if std::env::var("SHOPPING_PARQUET").as_deref() == Ok("crate") {
+                out::write(
+                    &path,
+                    out::USER_SCHEMA,
+                    vec![
+                        out::Col::Str(names, name_ends),
+                        out::Col::I32(day),
+                        out::Col::I64(s),
+                        out::Col::I64(e),
+                        out::Col::I64(r),
+                        out::Col::OptStr(cats, cat_ends, defs),
+                    ],
+                )
+                .expect("write user_daily");
+            } else {
+                let n = day.len();
+                pq::write(
+                    &path,
+                    &["user_id", "day", "sessions", "events", "revenue_cents", "top_category"],
+                    &[
+                        pq::Col::Str(&names, &name_ends),
+                        pq::Col::Date(&day),
+                        pq::Col::I64(&s),
+                        pq::Col::I64(&e),
+                        pq::Col::I64(&r),
+                        pq::Col::OptStr(&cats, &cat_ends, &defs),
+                    ],
+                    n,
+                )
+                .expect("write user_daily");
+            }
         }
     });
     log("output written", t0);

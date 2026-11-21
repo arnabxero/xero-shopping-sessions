@@ -7,11 +7,11 @@ COPY Cargo.toml Cargo.lock ./
 # Fetch and build dependencies first (cached layer).
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
  && cargo fetch --locked \
- && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked \
+ && RUSTFLAGS="-C target-cpu=cascadelake" cargo build --release --locked \
  && rm -rf src
 COPY src ./src
 RUN touch src/main.rs \
- && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked --offline \
+ && RUSTFLAGS="-C target-cpu=cascadelake" cargo build --release --locked --offline \
  && strip target/release/shopping
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc

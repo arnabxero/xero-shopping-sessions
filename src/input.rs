@@ -283,6 +283,21 @@ fn cached_share(file: &File, len: usize) -> Option<f64> {
     Some(hit as f64 / n as f64)
 }
 
+/// Whether the file lives in memory (tmpfs or ramfs): always mapped, since
+/// its pages are resident by construction (the scorer mounts /data as tmpfs).
+#[cfg(target_os = "linux")]
+fn in_memory_fs(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    let t = st.f_type as i64;
+    t == TMPFS_MAGIC || t == RAMFS_MAGIC
+}
+
 /// The file opened again with O_DIRECT, if the filesystem accepts it.
 #[cfg(target_os = "linux")]
 fn open_direct(path: &Path) -> Option<File> {
@@ -304,7 +319,13 @@ fn open_one(path: &Path, mode: Mode) -> Option<InFile> {
     // Auto: mostly cached -> mmap; partly cached -> buffered reads (they use
     // the cached pages); mostly uncached or unknown -> O_DIRECT.
     #[cfg(target_os = "linux")]
-    let share = if mode == Mode::Auto { cached_share(&file, len) } else { None };
+    let share = if mode != Mode::Auto {
+        None
+    } else if in_memory_fs(&file) {
+        Some(1.0)
+    } else {
+        cached_share(&file, len)
+    };
     #[cfg(not(target_os = "linux"))]
     let share: Option<f64> = Some(1.0);
     let use_map = match mode {
