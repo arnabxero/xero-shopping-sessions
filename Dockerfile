@@ -4,7 +4,7 @@
 FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static"
+ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=-avx512f,+crt-static"
 # Fetch and build dependencies first (cached layer).
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
  && cargo fetch --locked \

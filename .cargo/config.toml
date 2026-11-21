@@ -1,4 +1,5 @@
 # cascadelake: the scorers are Cascade Lake (or newer) Xeons with AVX-512 (confirmed by the
-# diagnostic run); the benchmark server (Zen 4) supports the same AVX-512 subsets.
+# diagnostic run). AVX-512 is turned off: 512-bit instructions lower the clock of Cascade Lake
+# cores, and the code needs only AVX2/BMI2.
 [build]
-rustflags = ["-C", "target-cpu=cascadelake"]
+rustflags = ["-C", "target-cpu=cascadelake", "-C", "target-feature=-avx512f"]
