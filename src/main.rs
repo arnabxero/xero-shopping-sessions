@@ -1433,5 +1433,58 @@ fn main() {
     }
     let _ = keys::any_fallback();
     // Skip destructors of the big tables; the kernel reclaims everything.
+    fast_teardown();
     std::process::exit(0);
 }
+
+/// Hand the large anonymous mappings back to the kernel from several threads, then exit.
+/// Process teardown frees pages on one thread; with gigabytes mapped that is a visible
+/// part of the wall time. Everything has been written and closed by now, and nothing
+/// reads this memory again (the process exits right after, without running destructors).
+#[cfg(target_os = "linux")]
+fn fast_teardown() {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for line in maps.lines() {
+        let mut it = line.split_ascii_whitespace();
+        let (Some(range), Some(perms), Some(_off), Some(_dev), Some(inode)) =
+            (it.next(), it.next(), it.next(), it.next(), it.next()) else { continue };
+        // private, writable, anonymous (no backing file, not stack/heap/vdso)
+        if perms != "rw-p" || inode != "0" || it.next().is_some() {
+            continue;
+        }
+        let Some((a, b)) = range.split_once('-') else { continue };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+        if b - a >= (32 << 20) {
+            ranges.push((a, b));
+        }
+    }
+    const STEP: usize = 64 << 20;
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in ranges {
+        let mut x = a;
+        while x < b {
+            let y = (x + STEP).min(b);
+            chunks.push((x, y));
+            x = y;
+        }
+    }
+    if chunks.is_empty() {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let n = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
+    std::thread::scope(|sc| {
+        for _ in 0..n {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(a, b)) = chunks.get(i) else { break };
+                unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED) };
+            });
+        }
+    });
+    unsafe { libc::_exit(0) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fast_teardown() {}
