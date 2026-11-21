@@ -2,6 +2,7 @@
 //! README.md for the design.
 
 mod csv;
+mod dsu;
 mod fastline;
 mod input;
 mod keys;
@@ -353,6 +354,12 @@ fn fast_event_rec(ctx: &Ctx, e: &fastline::Event) -> ERec {
 
 fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
     let shift = 64 - pbits();
+    parse_events_with(ctx, data, |rec| parts.push((mix(rec.eid) >> shift) as usize, rec));
+}
+
+/// The records of the event lines of `data` (lines skipped entirely give none).
+#[inline(always)]
+fn parse_events_with(ctx: &Ctx, data: &[u8], mut emit: impl FnMut(ERec)) {
     let mut dc = ts::DateCache::new();
     let mut pos = 0usize;
     if ctx.fast {
@@ -363,13 +370,12 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
         while pos + fastline::SPAN <= len {
             if let Some((e, n)) = unsafe { fastline::event(p0.add(pos), &ctx.years) } {
                 pos += n;
-                let rec = fast_event_rec(ctx, &e);
-                parts.push((mix(rec.eid) >> shift) as usize, rec);
+                emit(fast_event_rec(ctx, &e));
             } else {
                 let end = csv::memchr_nl(&data[pos..]).map_or(len, |i| pos + i);
                 if let Some(f) = csv::split::<7>(&data[pos..end]) {
                     if let Some(rec) = event_rec(ctx, &f, &mut dc) {
-                        parts.push((mix(rec.eid) >> shift) as usize, rec);
+                        emit(rec);
                     }
                 }
                 pos = end + 1;
@@ -379,7 +385,7 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
     if pos < data.len() {
         csv::for_each_line::<7, 128, _>(&data[pos..], |f| {
             if let Some(rec) = event_rec(ctx, f, &mut dc) {
-                parts.push((mix(rec.eid) >> shift) as usize, rec);
+                emit(rec);
             }
         });
     }
@@ -413,6 +419,12 @@ fn fast_click_rec(ctx: &Ctx, c: &fastline::Click) -> Option<CRec> {
 }
 
 fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
+    parse_clicks_with(ctx, data, |rec| out.push(rec));
+}
+
+/// The records of the valid clicks of `data`.
+#[inline(always)]
+fn parse_clicks_with(ctx: &Ctx, data: &[u8], mut emit: impl FnMut(CRec)) {
     let mut pos = 0usize;
     if ctx.fast {
         let len = data.len();
@@ -421,13 +433,13 @@ fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
             if let Some((c, n)) = unsafe { fastline::click(p0.add(pos), &ctx.years) } {
                 pos += n;
                 if let Some(rec) = fast_click_rec(ctx, &c) {
-                    out.push(rec);
+                    emit(rec);
                 }
             } else {
                 let end = csv::memchr_nl(&data[pos..]).map_or(len, |i| pos + i);
                 if let Some(f) = csv::split::<4>(&data[pos..end]) {
                     if let Some(rec) = click_rec(ctx, &f) {
-                        out.push(rec);
+                        emit(rec);
                     }
                 }
                 pos = end + 1;
@@ -437,7 +449,7 @@ fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
     if pos < data.len() {
         csv::for_each_line::<4, 64, _>(&data[pos..], |f| {
             if let Some(rec) = click_rec(ctx, f) {
-                out.push(rec);
+                emit(rec);
             }
         });
     }
@@ -770,6 +782,530 @@ fn profile(ctx: &Ctx, input: &Input, tasks: &[(usize, usize, usize)], threads: u
     eprintln!("sink {}", sink.load(Ordering::Relaxed));
 }
 
+/// Sizes and settings shared by the two routing pipelines.
+struct Shape {
+    threads: usize,
+    p1_threads: usize,
+    est_rows: usize,
+    est_clicks: usize,
+    smallcap: bool,
+    t0: Instant,
+}
+
+type Routed = (Vec<Scatter<PRec>>, Vec<Scatter<(u64, PClick)>>);
+
+/// The general pipeline: event records shuffled by event_id, deduplicated,
+/// then the winners and the clicks shuffled by person.
+fn route_exact(ctx: &Ctx, input: &Input, ln_tasks: &[(usize, usize, usize)], ck_tasks: &[(usize, usize, usize)], ev_tasks: &[(usize, usize, usize)], sh: &Shape) -> Routed {
+    let (threads, p1_threads, est_rows, smallcap, t0) = (sh.threads, sh.p1_threads, sh.est_rows, sh.smallcap, sh.t0);
+    let (np, nq) = (1usize << pbits(), 1usize << qbits());
+    // ----------------------------------------- links + events + clicks (+ persons)
+    // One task queue: link chunks first, then clicks, then events. The
+    // union-find starts as soon as the last link chunk is parsed, while the
+    // workers go on with clicks and events.
+    let link_out: Vec<Mutex<Vec<(u64, u64)>>> = (0..ln_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
+    let links_done = AtomicUsize::new(0);
+    // ------------------------------------------- events + clicks (+ persons)
+    let per_part = if smallcap { 1 } else { est_rows * 105 / 100 / np / p1_threads + 16 };
+    let ev_parts: Vec<Mutex<Option<Scatter<ERec>>>> = (0..p1_threads).map(|_| Mutex::new(None)).collect();
+    let ck_out: Vec<Mutex<Vec<CRec>>> = (0..ck_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
+    let persons: Mutex<Option<U64Map<u64>>> = Mutex::new(None);
+    let nl = ln_tasks.len();
+    let ntasks = nl + ck_tasks.len() + ev_tasks.len();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let dsu = s.spawn(|| {
+            while links_done.load(Ordering::Acquire) < nl {
+                std::thread::park_timeout(std::time::Duration::from_micros(200));
+            }
+            log("links parsed", t0);
+            let link_pairs: Vec<Vec<(u64, u64)>> =
+                link_out.iter().map(|m| std::mem::take(&mut *m.lock().unwrap())).collect();
+            let tm = Tm::now();
+            let m = build_persons(&link_pairs);
+            tadd(7, tm);
+            log("persons built", t0);
+            *persons.lock().unwrap() = Some(m);
+        });
+        let dsu_thread = dsu.thread().clone();
+        for w in 0..p1_threads {
+            let (next, ctx, input, ev_parts, ck_out, ck_tasks, ev_tasks, ln_tasks, link_out, links_done) = (
+                &next, &ctx, &input, &ev_parts, &ck_out, &ck_tasks, &ev_tasks, &ln_tasks, &link_out, &links_done,
+            );
+            let dsu_thread = dsu_thread.clone();
+            s.spawn(move || {
+                let mut guard = ev_parts[w].lock().unwrap();
+                let parts = guard.insert(Scatter::new(np, per_part));
+                let mut buf = ChunkBuf::default();
+                loop {
+                    let t = next.fetch_add(1, Ordering::Relaxed);
+                    if t >= ntasks {
+                        break;
+                    }
+                    let tm = Tm::now();
+                    if t < nl {
+                        let (fi, s, e) = ln_tasks[t];
+                        let mut v = Vec::new();
+                        parse_links(input.lines(fi, s, e, &mut buf), &mut v);
+                        *link_out[t].lock().unwrap() = v;
+                        if links_done.fetch_add(1, Ordering::AcqRel) + 1 == nl {
+                            dsu_thread.unpark();
+                        }
+                        continue;
+                    }
+                    let t = t - nl;
+                    if t < ck_tasks.len() {
+                        let (fi, s, e) = ck_tasks[t];
+                        let mut v = Vec::with_capacity((e - s) / 40 + 16);
+                        parse_clicks(ctx, input.lines(fi, s, e, &mut buf), &mut v);
+                        *ck_out[t].lock().unwrap() = v;
+                        tadd(6, tm);
+                    } else {
+                        let (fi, s, e) = ev_tasks[t - ck_tasks.len()];
+                        parse_events(ctx, input.lines(fi, s, e, &mut buf), parts);
+                        tadd(5, tm);
+                    }
+                }
+            });
+        }
+    });
+    let persons = persons.into_inner().unwrap().unwrap();
+    keys::freeze();
+    log("events/clicks parsed, persons built", t0);
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        eprintln!("phase1 thread-ms: events {:.0} clicks {:.0} persons {:.0}",
+            TIMERS[5].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[6].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[7].load(Ordering::Relaxed) as f64 / 1e6);
+    }
+
+    // ------------------------------------------------ dedup, route by person
+    let ev_parts: Vec<Scatter<ERec>> = ev_parts.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
+    let ck_recs: Vec<Vec<CRec>> = ck_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let per_q = if smallcap { 1 } else { est_rows * 105 / 100 / nq / threads + 16 };
+    let pe: Vec<Mutex<Option<Scatter<PRec>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
+    let n_clicks: usize = ck_recs.iter().map(|v| v.len()).sum();
+    let per_qc = if smallcap { 1 } else { n_clicks * 11 / 10 / nq / threads + 16 };
+    let pc: Vec<Mutex<Option<Scatter<(u64, PClick)>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
+    let person_of = |user: u64| persons.get(user).unwrap_or(user);
+    const WSHIFT: u32 = 26;
+    const IMASK: u32 = (1 << WSHIFT) - 1;
+    assert!(2 * p1_threads <= 63);
+    par_tasks(threads, np + ck_recs.len(), |w, t| {
+        let qshift = 64 - qbits();
+        if t < np {
+            let srcs: Vec<&[ERec]> = ev_parts.iter().flat_map(|v| v.part(t)).collect();
+            let n: usize = srcs.iter().map(|v| v.len()).sum();
+            if n == 0 {
+                return;
+            }
+            assert!(srcs.iter().all(|v| v.len() <= IMASK as usize));
+            let row = |x: u32| -> &ERec { unsafe { srcs.get_unchecked((x >> WSHIFT) as usize).get_unchecked((x & IMASK) as usize) } };
+            // Load factor at most 1/2: each probe may touch a random row.
+            let cap = (2 * n).next_power_of_two();
+            let mask = cap - 1;
+            let tm = Tm::now();
+            // Entries are fingerprint << 32 | row id, so a probe reads a row only
+            // when the 32-bit fingerprints match (row ids never reach u32::MAX).
+            const EMPTY: u64 = u64::MAX;
+            let mut table: Vec<u64> = vec![EMPTY; cap];
+            for (wi, src) in srcs.iter().enumerate() {
+                for (i, r) in src.iter().enumerate() {
+                    let id = ((wi as u32) << WSHIFT) | i as u32;
+                    let h = mix(r.eid);
+                    let fp = (h >> 16) as u32;
+                    let entry = (fp as u64) << 32 | id as u64;
+                    let mut s = h as usize & mask;
+                    loop {
+                        let e = table[s];
+                        if e == EMPTY {
+                            table[s] = entry;
+                            break;
+                        }
+                        if (e >> 32) as u32 == fp {
+                            let o = row(e as u32);
+                            if o.eid == r.eid {
+                                if r.ingest < o.ingest {
+                                    table[s] = entry;
+                                }
+                                break;
+                            }
+                        }
+                        s = (s + 1) & mask;
+                    }
+                }
+            }
+            tadd(0, tm);
+            let tm = Tm::now();
+            let mut guard = pe[w].lock().unwrap();
+            let out = guard.get_or_insert_with(|| Scatter::new(nq, per_q));
+            // One pass over the table: each valid winner's person-map slot is
+            // prefetched, and the winner is routed 16 winners later.
+            let mut emit = |x: u32| {
+                let r = row(x);
+                let person = person_of(r.user);
+                out.push((mix(person) >> qshift) as usize, PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
+            };
+            // Winners are found walking the rows in memory order: a valid row is
+            // its event's kept copy when the table entry for its event_id holds
+            // its own id.
+            let mut ring = [0u32; 16];
+            let mut n_in = 0usize;
+            for (wi, src) in srcs.iter().enumerate() {
+                for (i, r) in src.iter().enumerate() {
+                    if r.pc == INVALID {
+                        continue;
+                    }
+                    let x = ((wi as u32) << WSHIFT) | i as u32;
+                    let h = mix(r.eid);
+                    let fp = (h >> 16) as u32;
+                    let mut s = h as usize & mask;
+                    let winner = loop {
+                        let e = table[s];
+                        if e as u32 == x {
+                            break true;
+                        }
+                        if (e >> 32) as u32 == fp && row(e as u32).eid == r.eid {
+                            break false;
+                        }
+                        s = (s + 1) & mask;
+                    };
+                    if !winner {
+                        continue;
+                    }
+                    persons.prefetch(r.user);
+                    let slot = n_in & 15;
+                    if n_in >= 16 {
+                        emit(ring[slot]);
+                    }
+                    ring[slot] = x;
+                    n_in += 1;
+                }
+            }
+            for j in n_in.saturating_sub(16)..n_in {
+                emit(ring[j & 15]);
+            }
+            tadd(1, tm);
+        } else {
+            let tm = Tm::now();
+            let mut guard = pc[w].lock().unwrap();
+            let out = guard.get_or_insert_with(|| Scatter::new(nq, per_qc));
+            let cr = &ck_recs[t - np];
+            for (i, c) in cr.iter().enumerate() {
+                if let Some(y) = cr.get(i + 24) {
+                    persons.prefetch(y.user);
+                }
+                let person = person_of(c.user);
+                out.push((mix(person) >> qshift) as usize, (person, PClick { ts: c.ts, camp: c.camp, cid: c.cid }));
+            }
+            tadd(2, tm);
+        }
+    });
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        let g = |i: usize| TIMERS[i].load(Ordering::Relaxed) as f64 / 1e6;
+        eprintln!("phase2 thread-ms: dedup {:.0} winners {:.0} clicks {:.0}", g(0), g(1), g(2));
+    }
+    drop(ev_parts);
+    drop(ck_recs);
+    log("dedup + routing done", t0);
+    let pe: Vec<Scatter<PRec>> = pe.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
+    let pc: Vec<Scatter<(u64, PClick)>> = pc.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
+    (pe, pc)
+
+}
+
+/// Bits of a P-row location below the worker: partition, index in it.
+const LOC_Q: u32 = 13;
+const LOC_I: u32 = 22;
+/// The location of an event without a P row (it failed validation).
+const NO_LOC: u64 = (1 << 40) - 1;
+
+/// An event line's dedup record in the one-shuffle pipeline, routed by the
+/// top bits of h = mix(event_id). mix is a bijection, so equal h means equal
+/// event_id; the partition implies the top 8 bits of h, whose place holds the
+/// high bits of the location of the event's P row.
+#[derive(Clone, Copy, Default)]
+struct DRec {
+    /// h << 8 | loc >> 32
+    a: u64,
+    /// (ingest - ibase) << 32 | loc & 0xFFFF_FFFF
+    b: u64,
+}
+
+impl DRec {
+    #[inline(always)]
+    fn new(h: u64, off: u32, loc: u64) -> DRec {
+        DRec { a: (h << 8) | (loc >> 32), b: ((off as u64) << 32) | (loc & 0xFFFF_FFFF) }
+    }
+
+    #[inline(always)]
+    fn loc(&self) -> u64 {
+        ((self.a & 0xFF) << 32) | (self.b & 0xFFFF_FFFF)
+    }
+}
+
+/// Rows between a person-map prefetch and its lookup.
+const RING: usize = 16;
+
+/// One parse worker's output in the one-shuffle pipeline: dedup records by
+/// event_id, valid events (P rows) and valid clicks by person.
+struct Sink<'a> {
+    persons: &'a dsu::Persons,
+    w: u64,
+    pshift: u32,
+    qshift: u32,
+    ibase: i64,
+    d: Scatter<DRec>,
+    p: Scatter<PRec>,
+    c: Scatter<(u64, PClick)>,
+    /// h, ingest offset, user, ts << 32 | pc
+    ering: [(u64, u32, u64, u64); RING],
+    ne: usize,
+    cring: [(u64, PClick); RING],
+    nc: usize,
+    /// Set by an input this pipeline cannot represent exactly (an ingest_ts
+    /// far from the window, a partition past the location bits).
+    fallback: bool,
+}
+
+impl Sink<'_> {
+    #[inline(always)]
+    fn event(&mut self, r: ERec) {
+        // Offsets past u32::MAX are all invalid rows (ingest_ts more than a day
+        // after window_end): clamping them keeps every comparison that can
+        // decide a valid row. Below ibase there is no such guarantee.
+        let off = r.ingest.saturating_sub(self.ibase);
+        if off < 0 {
+            self.fallback = true;
+        }
+        let off = off.clamp(0, u32::MAX as i64) as u32;
+        let h = mix(r.eid);
+        if r.pc == INVALID {
+            self.d.push((h >> self.pshift) as usize, DRec::new(h, off, NO_LOC));
+            return;
+        }
+        self.persons.prefetch(r.user);
+        let slot = self.ne % RING;
+        if self.ne >= RING {
+            let x = self.ering[slot];
+            self.emit_event(x);
+        }
+        self.ering[slot] = (h, off, r.user, ((r.ts as u64) << 32) | r.pc as u64);
+        self.ne += 1;
+    }
+
+    #[inline(always)]
+    fn emit_event(&mut self, (h, off, user, tspc): (u64, u32, u64, u64)) {
+        let person = self.persons.get(user).unwrap_or(user);
+        let q = (mix(person) >> self.qshift) as usize;
+        let i = self.p.push_idx(q, PRec { person, tspc });
+        if i >= 1 << LOC_I {
+            self.fallback = true;
+        }
+        let loc = (self.w << (LOC_Q + LOC_I)) | ((q as u64) << LOC_I) | (i as u64 & ((1 << LOC_I) - 1));
+        self.d.push((h >> self.pshift) as usize, DRec::new(h, off, loc));
+    }
+
+    #[inline(always)]
+    fn click(&mut self, c: CRec) {
+        self.persons.prefetch(c.user);
+        let slot = self.nc % RING;
+        if self.nc >= RING {
+            let x = self.cring[slot];
+            self.emit_click(x);
+        }
+        self.cring[slot] = (c.user, PClick { ts: c.ts, camp: c.camp, cid: c.cid });
+        self.nc += 1;
+    }
+
+    #[inline(always)]
+    fn emit_click(&mut self, (user, k): (u64, PClick)) {
+        let person = self.persons.get(user).unwrap_or(user);
+        self.c.push((mix(person) >> self.qshift) as usize, (person, k));
+    }
+
+    fn flush(&mut self) {
+        for j in self.ne.saturating_sub(RING)..self.ne {
+            let x = self.ering[j % RING];
+            self.emit_event(x);
+        }
+        for j in self.nc.saturating_sub(RING)..self.nc {
+            let x = self.cring[j % RING];
+            self.emit_click(x);
+        }
+        self.ne = 0;
+        self.nc = 0;
+    }
+}
+
+/// The one-shuffle pipeline: persons first (links on all threads), so each
+/// valid event goes straight to its person's partition and each click too;
+/// only a 16-byte dedup record per event goes by event_id. Deduplication then
+/// turns the rows of losing copies into tombstones in place. None when the
+/// input needs the general pipeline (see Sink::fallback).
+fn route_fast(ctx: &Ctx, input: &Input, ln_tasks: &[(usize, usize, usize)], ck_tasks: &[(usize, usize, usize)], ev_tasks: &[(usize, usize, usize)], sh: &Shape) -> Option<Routed> {
+    let (threads, p1_threads, t0) = (sh.threads, sh.p1_threads, sh.t0);
+    if pbits() < 8 || qbits() > LOC_Q || p1_threads > 31 {
+        return None;
+    }
+    let (np, nq) = (1usize << pbits(), 1usize << qbits());
+
+    // ---------------------------------------------- links, then persons
+    let link_out: Vec<Mutex<Vec<(u64, u64)>>> = (0..ln_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
+    par_tasks(p1_threads, ln_tasks.len(), |_, t| {
+        let mut buf = ChunkBuf::default();
+        let (fi, s, e) = ln_tasks[t];
+        let mut v = Vec::new();
+        parse_links(input.lines(fi, s, e, &mut buf), &mut v);
+        *link_out[t].lock().unwrap() = v;
+    });
+    let link_pairs: Vec<Vec<(u64, u64)>> = link_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    keys::freeze();
+    log("links parsed", t0);
+    let persons = dsu::build(&link_pairs, threads);
+    drop(link_pairs);
+    log("persons built", t0);
+
+    // ------------------------------------------------- events and clicks
+    let per_d = if sh.smallcap { 1 } else { sh.est_rows * 105 / 100 / np / p1_threads + 16 };
+    let per_p = if sh.smallcap { 1 } else { sh.est_rows * 105 / 100 / nq / p1_threads + 16 };
+    let per_c = if sh.smallcap { 1 } else { sh.est_clicks * 105 / 100 / nq / p1_threads + 16 };
+    // Valid events have ingest_ts < window_end + 1 day, so their offsets from
+    // ibase stay below u32::MAX - 1 day; offsets cover the 47 days below
+    // window_end + 2 days.
+    let ibase = ctx.we + 2 * DAY - (1i64 << 32);
+    type Out = (Scatter<DRec>, Scatter<PRec>, Scatter<(u64, PClick)>, bool);
+    let outs: Vec<Mutex<Option<Out>>> = (0..p1_threads).map(|_| Mutex::new(None)).collect();
+    let ntasks = ck_tasks.len() + ev_tasks.len();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for w in 0..p1_threads {
+            let (next, outs, persons) = (&next, &outs, &persons);
+            s.spawn(move || {
+                let mut sink = Sink {
+                    persons,
+                    w: w as u64,
+                    pshift: 64 - pbits(),
+                    qshift: 64 - qbits(),
+                    ibase,
+                    d: Scatter::new(np, per_d),
+                    p: Scatter::new(nq, per_p),
+                    c: Scatter::new(nq, per_c),
+                    ering: [(0, 0, 0, 0); RING],
+                    ne: 0,
+                    cring: [(0, PClick { ts: 0, camp: 0, cid: 0 }); RING],
+                    nc: 0,
+                    fallback: false,
+                };
+                let mut buf = ChunkBuf::default();
+                loop {
+                    let t = next.fetch_add(1, Ordering::Relaxed);
+                    if t >= ntasks {
+                        break;
+                    }
+                    let tm = Tm::now();
+                    if t < ck_tasks.len() {
+                        let (fi, s, e) = ck_tasks[t];
+                        parse_clicks_with(ctx, input.lines(fi, s, e, &mut buf), |c| sink.click(c));
+                        tadd(6, tm);
+                    } else {
+                        let (fi, s, e) = ev_tasks[t - ck_tasks.len()];
+                        parse_events_with(ctx, input.lines(fi, s, e, &mut buf), |r| sink.event(r));
+                        tadd(5, tm);
+                    }
+                }
+                sink.flush();
+                *outs[w].lock().unwrap() = Some((sink.d, sink.p, sink.c, sink.fallback));
+            });
+        }
+    });
+    let outs: Vec<Out> = outs.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
+    if outs.iter().any(|o| o.3) || std::env::var_os("SHOPPING_TEST_FALLBACK").is_some() {
+        log("input outside the one-shuffle pipeline's range: general pipeline", t0);
+        return None;
+    }
+    log("events/clicks parsed", t0);
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        eprintln!("phase1 thread-ms: events {:.0} clicks {:.0}",
+            TIMERS[5].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[6].load(Ordering::Relaxed) as f64 / 1e6);
+    }
+
+    // ------------------------------- dedup: losing copies become tombstones
+    let mut ds: Vec<Scatter<DRec>> = Vec::new();
+    let mut pe: Vec<Scatter<PRec>> = Vec::new();
+    let mut pc: Vec<Scatter<(u64, PClick)>> = Vec::new();
+    for (d, p, c, _) in outs {
+        ds.push(d);
+        pe.push(p);
+        pc.push(c);
+    }
+    let raws: Vec<scatter::Raw<PRec>> = pe.iter_mut().map(|s| s.raw()).collect();
+    const WSHIFT: u32 = 26;
+    const IMASK: u32 = (1 << WSHIFT) - 1;
+    par_tasks(threads, np, |_, t| {
+        let srcs: Vec<&[DRec]> = ds.iter().flat_map(|v| v.part(t)).collect();
+        let n: usize = srcs.iter().map(|v| v.len()).sum();
+        if n == 0 {
+            return;
+        }
+        assert!(srcs.len() < 64 && srcs.iter().all(|v| v.len() <= IMASK as usize));
+        let tm = Tm::now();
+        let row = |x: u32| -> &DRec { unsafe { srcs.get_unchecked((x >> WSHIFT) as usize).get_unchecked((x & IMASK) as usize) } };
+        // A losing copy's P row (if it has one) gets pc = INVALID. Each row
+        // belongs to one event_id, so one task touches it.
+        let tomb = |r: &DRec| {
+            let loc = r.loc();
+            if loc != NO_LOC {
+                let w = (loc >> (LOC_Q + LOC_I)) as usize;
+                let q = ((loc >> LOC_I) & ((1 << LOC_Q) - 1)) as usize;
+                let i = (loc & ((1 << LOC_I) - 1)) as usize;
+                unsafe { (*raws[w].at(q, i)).tspc |= INVALID as u64 };
+            }
+        };
+        let cap = (2 * n).next_power_of_two();
+        let mask = cap - 1;
+        // Entries are fingerprint << 32 | row id (as in route_exact).
+        const EMPTY: u64 = u64::MAX;
+        let mut table: Vec<u64> = vec![EMPTY; cap];
+        for (wi, src) in srcs.iter().enumerate() {
+            for (i, r) in src.iter().enumerate() {
+                let id = ((wi as u32) << WSHIFT) | i as u32;
+                let key = r.a >> 8;
+                let fp = (key >> 24) as u32;
+                let entry = ((fp as u64) << 32) | id as u64;
+                let mut s = key as usize & mask;
+                loop {
+                    let e = table[s];
+                    if e == EMPTY {
+                        table[s] = entry;
+                        break;
+                    }
+                    if (e >> 32) as u32 == fp {
+                        let o = row(e as u32);
+                        if o.a >> 8 == key {
+                            // The earliest ingest_ts wins; on a tie the copy seen first.
+                            if r.b >> 32 < o.b >> 32 {
+                                tomb(o);
+                                table[s] = entry;
+                            } else {
+                                tomb(r);
+                            }
+                            break;
+                        }
+                    }
+                    s = (s + 1) & mask;
+                }
+            }
+        }
+        tadd(0, tm);
+    });
+    drop(raws);
+    drop(ds);
+    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+        eprintln!("phase2 thread-ms: dedup {:.0}", TIMERS[0].load(Ordering::Relaxed) as f64 / 1e6);
+    }
+    log("dedup done", t0);
+    Some((pe, pc))
+}
+
 fn main() {
     let t0 = Instant::now();
     // Keep freed memory mapped for reuse: purging (MADV_DONTNEED) makes the
@@ -953,222 +1489,33 @@ fn main() {
         return;
     }
 
-    // ----------------------------------------- links + events + clicks (+ persons)
-    // One task queue: link chunks first, then clicks, then events. The
-    // union-find starts as soon as the last link chunk is parsed, while the
-    // workers go on with clicks and events.
-    let link_out: Vec<Mutex<Vec<(u64, u64)>>> = (0..ln_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
-    let links_done = AtomicUsize::new(0);
-    // ------------------------------------------- events + clicks (+ persons)
+    // ------------------------------------------------- read and route
     // SHOPPING_TEST_SMALLCAP=1 forces tiny partition regions so the overflow paths get tested.
-    let smallcap = std::env::var_os("SHOPPING_TEST_SMALLCAP").is_some();
-    let per_part = if smallcap { 1 } else { est_rows * 105 / 100 / np / p1_threads + 16 };
-    let ev_parts: Vec<Mutex<Option<Scatter<ERec>>>> = (0..p1_threads).map(|_| Mutex::new(None)).collect();
-    let ck_out: Vec<Mutex<Vec<CRec>>> = (0..ck_tasks.len()).map(|_| Mutex::new(Vec::new())).collect();
-    let persons: Mutex<Option<U64Map<u64>>> = Mutex::new(None);
-    let nl = ln_tasks.len();
-    let ntasks = nl + ck_tasks.len() + ev_tasks.len();
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        let dsu = s.spawn(|| {
-            while links_done.load(Ordering::Acquire) < nl {
-                std::thread::park_timeout(std::time::Duration::from_micros(200));
-            }
-            log("links parsed", t0);
-            let link_pairs: Vec<Vec<(u64, u64)>> =
-                link_out.iter().map(|m| std::mem::take(&mut *m.lock().unwrap())).collect();
-            let tm = Tm::now();
-            let m = build_persons(&link_pairs);
-            tadd(7, tm);
-            log("persons built", t0);
-            *persons.lock().unwrap() = Some(m);
-        });
-        let dsu_thread = dsu.thread().clone();
-        for w in 0..p1_threads {
-            let (next, ctx, input, ev_parts, ck_out, ck_tasks, ev_tasks, ln_tasks, link_out, links_done) = (
-                &next, &ctx, &input, &ev_parts, &ck_out, &ck_tasks, &ev_tasks, &ln_tasks, &link_out, &links_done,
-            );
-            let dsu_thread = dsu_thread.clone();
-            s.spawn(move || {
-                let mut guard = ev_parts[w].lock().unwrap();
-                let parts = guard.insert(Scatter::new(np, per_part));
-                let mut buf = ChunkBuf::default();
-                loop {
-                    let t = next.fetch_add(1, Ordering::Relaxed);
-                    if t >= ntasks {
-                        break;
-                    }
-                    let tm = Tm::now();
-                    if t < nl {
-                        let (fi, s, e) = ln_tasks[t];
-                        let mut v = Vec::new();
-                        parse_links(input.lines(fi, s, e, &mut buf), &mut v);
-                        *link_out[t].lock().unwrap() = v;
-                        if links_done.fetch_add(1, Ordering::AcqRel) + 1 == nl {
-                            dsu_thread.unpark();
-                        }
-                        continue;
-                    }
-                    let t = t - nl;
-                    if t < ck_tasks.len() {
-                        let (fi, s, e) = ck_tasks[t];
-                        let mut v = Vec::with_capacity((e - s) / 40 + 16);
-                        parse_clicks(ctx, input.lines(fi, s, e, &mut buf), &mut v);
-                        *ck_out[t].lock().unwrap() = v;
-                        tadd(6, tm);
-                    } else {
-                        let (fi, s, e) = ev_tasks[t - ck_tasks.len()];
-                        parse_events(ctx, input.lines(fi, s, e, &mut buf), parts);
-                        tadd(5, tm);
-                    }
-                }
-            });
-        }
-    });
-    let persons = persons.into_inner().unwrap().unwrap();
+    let ck_bytes: usize = ck_tasks.iter().map(|&(_, s, e)| e - s).sum();
+    let sh = Shape {
+        threads,
+        p1_threads,
+        est_rows,
+        est_clicks: ck_bytes / 30 + 1,
+        smallcap: std::env::var_os("SHOPPING_TEST_SMALLCAP").is_some(),
+        t0,
+    };
+    // SHOPPING_EXACT=1 runs the general pipeline.
+    let routed = if std::env::var_os("SHOPPING_EXACT").is_some() {
+        None
+    } else {
+        route_fast(&ctx, &input, &ln_tasks, &ck_tasks, &ev_tasks, &sh)
+    };
+    let (pe, pc) = match routed {
+        Some(r) => r,
+        None => route_exact(&ctx, &input, &ln_tasks, &ck_tasks, &ev_tasks, &sh),
+    };
     keys::freeze();
     // Nothing refers to the input mappings any more: unmap them off the
     // critical path instead of at process exit.
     std::thread::spawn(move || drop(input));
-    log("events/clicks parsed, persons built", t0);
-    if std::env::var_os("SHOPPING_DEBUG").is_some() {
-        eprintln!("phase1 thread-ms: events {:.0} clicks {:.0} persons {:.0}",
-            TIMERS[5].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[6].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[7].load(Ordering::Relaxed) as f64 / 1e6);
-    }
-
-    // ------------------------------------------------ dedup, route by person
-    let ev_parts: Vec<Scatter<ERec>> = ev_parts.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
-    let ck_recs: Vec<Vec<CRec>> = ck_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let per_q = if smallcap { 1 } else { est_rows * 105 / 100 / nq / threads + 16 };
-    let pe: Vec<Mutex<Option<Scatter<PRec>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
-    let n_clicks: usize = ck_recs.iter().map(|v| v.len()).sum();
-    let per_qc = if smallcap { 1 } else { n_clicks * 11 / 10 / nq / threads + 16 };
-    let pc: Vec<Mutex<Option<Scatter<(u64, PClick)>>>> = (0..threads).map(|_| Mutex::new(None)).collect();
-    let person_of = |user: u64| persons.get(user).unwrap_or(user);
-    const WSHIFT: u32 = 26;
-    const IMASK: u32 = (1 << WSHIFT) - 1;
-    assert!(2 * p1_threads <= 63);
-    par_tasks(threads, np + ck_recs.len(), |w, t| {
-        let qshift = 64 - qbits();
-        if t < np {
-            let srcs: Vec<&[ERec]> = ev_parts.iter().flat_map(|v| v.part(t)).collect();
-            let n: usize = srcs.iter().map(|v| v.len()).sum();
-            if n == 0 {
-                return;
-            }
-            assert!(srcs.iter().all(|v| v.len() <= IMASK as usize));
-            let row = |x: u32| -> &ERec { unsafe { srcs.get_unchecked((x >> WSHIFT) as usize).get_unchecked((x & IMASK) as usize) } };
-            // Load factor at most 1/2: each probe may touch a random row.
-            let cap = (2 * n).next_power_of_two();
-            let mask = cap - 1;
-            let tm = Tm::now();
-            // Entries are fingerprint << 32 | row id, so a probe reads a row only
-            // when the 32-bit fingerprints match (row ids never reach u32::MAX).
-            const EMPTY: u64 = u64::MAX;
-            let mut table: Vec<u64> = vec![EMPTY; cap];
-            for (wi, src) in srcs.iter().enumerate() {
-                for (i, r) in src.iter().enumerate() {
-                    let id = ((wi as u32) << WSHIFT) | i as u32;
-                    let h = mix(r.eid);
-                    let fp = (h >> 16) as u32;
-                    let entry = (fp as u64) << 32 | id as u64;
-                    let mut s = h as usize & mask;
-                    loop {
-                        let e = table[s];
-                        if e == EMPTY {
-                            table[s] = entry;
-                            break;
-                        }
-                        if (e >> 32) as u32 == fp {
-                            let o = row(e as u32);
-                            if o.eid == r.eid {
-                                if r.ingest < o.ingest {
-                                    table[s] = entry;
-                                }
-                                break;
-                            }
-                        }
-                        s = (s + 1) & mask;
-                    }
-                }
-            }
-            tadd(0, tm);
-            let tm = Tm::now();
-            let mut guard = pe[w].lock().unwrap();
-            let out = guard.get_or_insert_with(|| Scatter::new(nq, per_q));
-            // One pass over the table: each valid winner's person-map slot is
-            // prefetched, and the winner is routed 16 winners later.
-            let mut emit = |x: u32| {
-                let r = row(x);
-                let person = person_of(r.user);
-                out.push((mix(person) >> qshift) as usize, PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
-            };
-            // Winners are found walking the rows in memory order: a valid row is
-            // its event's kept copy when the table entry for its event_id holds
-            // its own id.
-            let mut ring = [0u32; 16];
-            let mut n_in = 0usize;
-            for (wi, src) in srcs.iter().enumerate() {
-                for (i, r) in src.iter().enumerate() {
-                    if r.pc == INVALID {
-                        continue;
-                    }
-                    let x = ((wi as u32) << WSHIFT) | i as u32;
-                    let h = mix(r.eid);
-                    let fp = (h >> 16) as u32;
-                    let mut s = h as usize & mask;
-                    let winner = loop {
-                        let e = table[s];
-                        if e as u32 == x {
-                            break true;
-                        }
-                        if (e >> 32) as u32 == fp && row(e as u32).eid == r.eid {
-                            break false;
-                        }
-                        s = (s + 1) & mask;
-                    };
-                    if !winner {
-                        continue;
-                    }
-                    persons.prefetch(r.user);
-                    let slot = n_in & 15;
-                    if n_in >= 16 {
-                        emit(ring[slot]);
-                    }
-                    ring[slot] = x;
-                    n_in += 1;
-                }
-            }
-            for j in n_in.saturating_sub(16)..n_in {
-                emit(ring[j & 15]);
-            }
-            tadd(1, tm);
-        } else {
-            let tm = Tm::now();
-            let mut guard = pc[w].lock().unwrap();
-            let out = guard.get_or_insert_with(|| Scatter::new(nq, per_qc));
-            let cr = &ck_recs[t - np];
-            for (i, c) in cr.iter().enumerate() {
-                if let Some(y) = cr.get(i + 24) {
-                    persons.prefetch(y.user);
-                }
-                let person = person_of(c.user);
-                out.push((mix(person) >> qshift) as usize, (person, PClick { ts: c.ts, camp: c.camp, cid: c.cid }));
-            }
-            tadd(2, tm);
-        }
-    });
-    if std::env::var_os("SHOPPING_DEBUG").is_some() {
-        let g = |i: usize| TIMERS[i].load(Ordering::Relaxed) as f64 / 1e6;
-        eprintln!("phase2 thread-ms: dedup {:.0} winners {:.0} clicks {:.0}", g(0), g(1), g(2));
-    }
-    drop(ev_parts);
-    drop(ck_recs);
-    log("dedup + routing done", t0);
 
     // ------------------------------------- sessionize, attribute, aggregate
-    let pe: Vec<Scatter<PRec>> = pe.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
-    let pc: Vec<Scatter<(u64, PClick)>> = pc.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
     let mut order: Vec<(usize, usize)> =
         (0..nq).map(|q| (pe.iter().map(|v| v.part_len(q)).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
@@ -1188,8 +1535,12 @@ fn main() {
         // The partition's rows: plain slices, walked with simple nested loops.
         let eparts: Vec<&[PRec]> = pe.iter().flat_map(|v| v.part(q)).collect();
         let cparts: Vec<&[(u64, PClick)]> = pc.iter().flat_map(|v| v.part(q)).collect();
+        // Rows with pc = INVALID are tombstones of losing duplicates.
         for part in &eparts {
             for r in part.iter() {
+                if r.tspc as u32 == INVALID {
+                    continue;
+                }
                 let s = lmap.insert_slot(r.person);
                 let l = if lmap.val_at(s) == 0 {
                     persons_l.push(r.person);
@@ -1214,11 +1565,15 @@ fn main() {
         off.push(acc);
         let mut cur: Vec<u32> = off[..np].to_vec();
         // Every slot is written by the counting sort below.
-        let mut evs: Vec<u64> = Vec::with_capacity(n);
-        unsafe { evs.set_len(n) };
+        let live = acc as usize;
+        let mut evs: Vec<u64> = Vec::with_capacity(live);
+        unsafe { evs.set_len(live) };
         let mut k = 0;
         for part in &eparts {
             for r in part.iter() {
+                if r.tspc as u32 == INVALID {
+                    continue;
+                }
                 let l = loc[k] as usize;
                 evs[cur[l] as usize] = r.tspc;
                 cur[l] += 1;
