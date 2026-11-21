@@ -20,4 +20,5 @@ COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/shopping /shoppin
 # The scorer runs as uid 1000 with a read-only root; the binary only reads
 # /data and writes /output, and needs no shell, libc files, home or temp dir.
 USER 1000:1000
+ENV NCPU=4
 CMD ["/shopping"]
