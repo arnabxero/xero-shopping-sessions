@@ -1,22 +1,22 @@
 //! Fast path for the common shape of event and click lines.
 //!
-//! The line is read field by field in place, with 16-byte vector loads: an
-//! optional opening quote, content matching a narrow grammar (an ID of 1 to 10
-//! bytes of `[0-9A-Za-z_]`, a timestamp in form F1, F2 or F3, an event type,
-//! a run of digits), the closing quote when one was opened, then the
-//! separator (`,`, or `\n` after the last field). None of these grammars
-//! admits `,`, `"` or `\n`, so a line accepted here has exactly the expected
-//! number of fields, quotes only around whole fields, and the field values the
-//! strict reader (`csv::split`) gives. Everything else (rare forms, bad values,
-//! malformed lines) returns None and the caller reads that line the general
-//! way, so the fast path never decides anything the general path would decide
+//! One 128-byte window gives the line's newline and the commas before it, so
+//! every field's span is known at once; each field is then checked and
+//! decoded on its own with 16-byte vector loads: content of a narrow grammar
+//! (an ID of 1 to 10 bytes of `[0-9A-Za-z_]`, a timestamp in form F1, F2 or
+//! F3, an event type, a run of digits), optionally wrapped in a quote pair.
+//! None of these grammars admits `"`, so a line accepted here has quotes only
+//! around whole fields and exactly the field values the strict reader
+//! (`csv::split`) gives. Everything else (rare forms, bad values, malformed
+//! lines) returns None and the caller reads that line the general way, so the
+//! fast path never decides anything the general path would decide
 //! differently.
 
 use crate::ts;
 
 /// Bytes that must be readable from the start of a line for the fast path
-/// (the longest accepted event line reads 120 bytes from its start).
-pub const SPAN: usize = 128;
+/// (the 128-byte window, and 16-byte loads at field starts inside it).
+pub const SPAN: usize = 160;
 
 /// The years whose dates the fast path decodes (at most two: the window plus
 /// a few days on each side never spans more), as their four ASCII bytes and the
@@ -93,36 +93,71 @@ mod simd {
         (codes, bad)
     }
 
-    /// The opening quote flag and the content start of the field at `p`.
+    /// Newline and comma bitmasks of the 128 bytes at `p`.
     #[inline(always)]
-    unsafe fn open(p: *const u8) -> (usize, *const u8) {
-        let q = (*p == b'"') as usize;
-        (q, p.add(q))
+    unsafe fn masks(p: *const u8) -> (u128, u128) {
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let v2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+        let v3 = _mm256_loadu_si256(p.add(96) as *const __m256i);
+        let m = |c: u8| -> u128 {
+            let s = _mm256_set1_epi8(c as i8);
+            let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, s)) as u32 as u64;
+            let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, s)) as u32 as u64;
+            let c2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, s)) as u32 as u64;
+            let d = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v3, s)) as u32 as u64;
+            ((a | (b << 32)) as u128) | (((c2 | (d << 32)) as u128) << 64)
+        };
+        (m(b'\n'), m(b','))
     }
 
-    /// Content of length `n` at `c`, opened with `q` quotes: the closing quote
-    /// and the separator `term` must follow. Returns the next field's start.
+    /// The line at `p` split at its first newline and at the commas before
+    /// it: the end of each of the `N` fields (the last one ends at the
+    /// newline), or None unless there are exactly N - 1 commas.
     #[inline(always)]
-    unsafe fn close(c: *const u8, n: usize, q: usize, term: u8) -> Option<*const u8> {
-        let e = c.add(n);
-        if (*e.add(q) == term) & ((q == 0) | (*e == b'"')) {
-            Some(e.add(q + 1))
-        } else {
-            None
+    pub unsafe fn split<const N: usize>(p: *const u8) -> Option<[usize; N]> {
+        let (nl, cm) = masks(p);
+        if nl == 0 {
+            return None;
         }
+        let ll = nl.trailing_zeros() as usize;
+        let mut c = cm & ((1u128 << ll) - 1);
+        if c.count_ones() as usize != N - 1 {
+            return None;
+        }
+        let mut ends = [ll; N];
+        for e in ends.iter_mut().take(N - 1) {
+            *e = c.trailing_zeros() as usize;
+            c &= c - 1;
+        }
+        Some(ends)
+    }
+
+    /// The content of field [s, e) of the line at `p`: without its quotes if
+    /// it is wrapped in a pair (as csv::split). Any other quote stays in the
+    /// content, where no grammar below accepts it.
+    #[inline(always)]
+    unsafe fn content(p: *const u8, s: usize, e: usize) -> (*const u8, usize) {
+        let n = e - s;
+        let q = ((n >= 2) & (*p.add(s) == b'"') & (*p.add(e - 1) == b'"')) as usize;
+        (p.add(s + q), n - 2 * q)
+    }
+
+    /// Lanes 0..n of a 16-lane mask.
+    #[inline(always)]
+    fn low(n: usize) -> u32 {
+        (1u32 << n) - 1
     }
 
     /// An ID field (1 to 10 ID bytes): its packed key (as keys::pack).
     #[inline(always)]
-    pub unsafe fn key_field(p: *const u8, term: u8) -> Option<(u64, *const u8)> {
-        let (q, c) = open(p);
+    pub unsafe fn key_at(p: *const u8, s: usize, e: usize) -> Option<u64> {
+        let (c, n) = content(p, s, e);
         let v = _mm_loadu_si128(c as *const __m128i);
         let (codes, bad) = classify(v);
-        let n = (bad | 0x1_0000).trailing_zeros() as usize;
-        if n.wrapping_sub(1) >= 10 {
+        if n.wrapping_sub(1) >= 10 || bad & low(n) != 0 {
             return None;
         }
-        let next = close(c, n, q, term)?;
         let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         let codes = _mm_and_si128(codes, _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx));
         // c[2i] * 64 + c[2i+1], then pairs * 4096 + next pair: 4 codes per 32-bit lane.
@@ -131,7 +166,7 @@ mod simd {
         let l0 = _mm_cvtsi128_si32(m32) as u32 as u64;
         let l1 = _mm_extract_epi32(m32, 1) as u32 as u64;
         let l2 = _mm_extract_epi32(m32, 2) as u32 as u64;
-        Some(((l0 << 36) | (l1 << 12) | (l2 >> 12), next))
+        Some((l0 << 36) | (l1 << 12) | (l2 >> 12))
     }
 
     const fn shift_table() -> [[i8; 16]; 17] {
@@ -150,13 +185,15 @@ mod simd {
     /// Shuffles moving the first n bytes to the end of the vector (zeros before).
     static SHIFT: [[i8; 16]; 17] = shift_table();
 
-    /// The run of ASCII digits at `c` (at most 16 counted): its length and value.
+    /// The value of the `n` (at most 16) bytes at `c` if they are all ASCII digits.
     #[inline(always)]
-    pub unsafe fn digits(c: *const u8) -> (usize, u64) {
+    unsafe fn digits(c: *const u8, n: usize) -> Option<u64> {
         let v = _mm_loadu_si128(c as *const __m128i);
         let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
         let isd = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) as u32;
-        let n = (!isd).trailing_zeros() as usize;
+        if n > 16 || !isd & low(n) != 0 {
+            return None;
+        }
         let x = _mm_shuffle_epi8(d, _mm_loadu_si128(SHIFT.as_ptr().add(n) as *const __m128i));
         let m1 = _mm_maddubs_epi16(x, _mm_set1_epi16(0x010A));
         let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_0064));
@@ -164,13 +201,13 @@ mod simd {
         let m4 = _mm_madd_epi16(m3, _mm_set1_epi32(0x0001_2710));
         let a = _mm_cvtsi128_si32(m4) as u32 as u64;
         let b = _mm_extract_epi32(m4, 1) as u32 as u64;
-        (n, a * 100_000_000 + b)
+        Some(a * 100_000_000 + b)
     }
 
-    /// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at `c`, in
-    /// a year of `y`: milliseconds and the content length.
+    /// `YYYY-MM-DDTHH:MM:SS` at `c` (followed by `Z` or an offset, checked by
+    /// the caller), in a year of `y`: milliseconds.
     #[inline(always)]
-    unsafe fn date_time(c: *const u8, y: &Years) -> Option<(i64, usize)> {
+    unsafe fn date_time(c: *const u8, y: &Years) -> Option<i64> {
         let ys = (c as *const u32).read_unaligned();
         let yidx = if ys == y.ystr[0] {
             y.yidx[0]
@@ -185,9 +222,6 @@ mod simd {
         let sep = _mm_movemask_epi8(_mm_cmpeq_epi8(v, tmpl)) as u32;
         let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
         let dig = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) as u32;
-        if (sep & 0x1249) != 0x1249 || (dig & 0x6DB6) != 0x6DB6 {
-            return None;
-        }
         let pairs = _mm_shuffle_epi8(d, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
         // month, day, hour, minute, second
         let vals = _mm_maddubs_epi16(pairs, _mm_set1_epi16(0x010A));
@@ -195,7 +229,7 @@ mod simd {
             _mm_cmpgt_epi16(vals, _mm_setr_epi16(12, 31, 23, 59, 59, 0, 0, 0)),
             _mm_cmpgt_epi16(_mm_setr_epi16(1, 1, 0, 0, 0, 0, 0, 0), vals),
         );
-        if _mm_movemask_epi8(out) != 0 {
+        if (sep & 0x1249) != 0x1249 || (dig & 0x6DB6) != 0x6DB6 || _mm_movemask_epi8(out) != 0 {
             return None;
         }
         let x = _mm_cvtsi128_si64(vals) as u64;
@@ -208,74 +242,63 @@ mod simd {
         if day > len as i64 {
             return None;
         }
-        let ms = ((first + day - 1) * 86_400 + hour * 3600 + minute * 60 + second) * 1000;
-        match *c.add(19) {
-            b'Z' => Some((ms, 20)),
-            sign @ (b'+' | b'-') => {
+        Some(((first + day - 1) * 86_400 + hour * 3600 + minute * 60 + second) * 1000)
+    }
+
+    /// A timestamp field: F1 or F2 in a year of `y`, or F3 of 1 to 16 digits.
+    #[inline(always)]
+    pub unsafe fn ts_at(p: *const u8, s: usize, e: usize, y: &Years) -> Option<i64> {
+        let (c, n) = content(p, s, e);
+        match n {
+            20 if *c.add(19) == b'Z' => date_time(c, y),
+            25 => {
+                let sign = *c.add(19);
                 let o = |i: usize| (*c.add(i)).wrapping_sub(b'0') as i64;
-                let (a, b, e, f) = (o(20), o(21), o(23), o(24));
-                if *c.add(22) != b':' || a > 9 || b > 9 || e > 9 || f > 9 {
+                let (a, b, g, h) = (o(20), o(21), o(23), o(24));
+                if (sign != b'+' && sign != b'-') || *c.add(22) != b':' || a > 9 || b > 9 || g > 9 || h > 9 {
                     return None;
                 }
-                let (oh, om) = (a * 10 + b, e * 10 + f);
+                let (oh, om) = (a * 10 + b, g * 10 + h);
                 if oh > 23 || om > 59 {
                     return None;
                 }
+                let ms = date_time(c, y)?;
                 let off = (oh * 60 + om) * 60_000;
-                Some((if sign == b'+' { ms - off } else { ms + off }, 25))
+                Some(if sign == b'+' { ms - off } else { ms + off })
             }
+            1..=16 => digits(c, n).map(|v| v as i64),
             _ => None,
         }
     }
 
-    /// A timestamp field: F1/F2 in a year of `y`, or F3 of 1 to 16 digits.
-    #[inline(always)]
-    pub unsafe fn ts_field(p: *const u8, term: u8, y: &Years) -> Option<(i64, *const u8)> {
-        let (q, c) = open(p);
-        let (t, n) = if *c.add(4) == b'-' {
-            date_time(c, y)?
-        } else {
-            let (n, v) = digits(c);
-            if n == 0 {
-                return None;
-            }
-            (v as i64, n)
-        };
-        Some((t, close(c, n, q, term)?))
-    }
-
     /// The event type field: view or cart (false) or purchase (true).
     #[inline(always)]
-    pub unsafe fn type_field(p: *const u8) -> Option<(bool, *const u8)> {
-        let (q, c) = open(p);
+    pub unsafe fn type_at(p: *const u8, s: usize, e: usize) -> Option<bool> {
+        let (c, n) = content(p, s, e);
         let w = (c as *const u64).read_unaligned();
-        let (purchase, n) = if w == u64::from_le_bytes(*b"purchase") {
-            (true, 8)
-        } else {
-            let w4 = w as u32;
-            if w4 == u32::from_le_bytes(*b"view") || w4 == u32::from_le_bytes(*b"cart") {
-                (false, 4)
-            } else {
-                return None;
-            }
-        };
-        Some((purchase, close(c, n, q, b',')?))
+        if n == 8 && w == u64::from_le_bytes(*b"purchase") {
+            return Some(true);
+        }
+        let w4 = w as u32;
+        if n == 4 && (w4 == u32::from_le_bytes(*b"view") || w4 == u32::from_le_bytes(*b"cart")) {
+            return Some(false);
+        }
+        None
     }
 
     /// A field of 0 to 15 digits: its value.
     #[inline(always)]
-    pub unsafe fn digits_field(p: *const u8, term: u8) -> Option<(u64, *const u8)> {
-        let (q, c) = open(p);
-        let (n, v) = digits(c);
+    pub unsafe fn digits_at(p: *const u8, s: usize, e: usize) -> Option<u64> {
+        let (c, n) = content(p, s, e);
         if n > 15 {
             return None;
         }
-        Some((v, close(c, n, q, term)?))
+        digits(c, n)
     }
 }
 
-/// The event line starting at `p` (SPAN bytes readable): its values and its
-/// length including the `\n`, or None for the general path.
+/// The event line starting at `p`: its values and its length including the
+/// `\n`, or None for the general path.
 ///
 /// # Safety
 /// `SPAN` bytes from `p` must be readable.
@@ -284,14 +307,17 @@ pub unsafe fn event(p: *const u8, y: &Years) -> Option<(Event, usize)> {
     #[cfg(target_feature = "avx2")]
     {
         use simd::*;
-        let (eid, p1) = key_field(p, b',')?;
-        let (user, p2) = key_field(p1, b',')?;
-        let (t, p3) = ts_field(p2, b',', y)?;
-        let (ingest, p4) = ts_field(p3, b',', y)?;
-        let (purchase, p5) = type_field(p4)?;
-        let (product, p6) = key_field(p5, b',')?;
-        let (price, p7) = digits_field(p6, b'\n')?;
-        Some((Event { eid, user, t, ingest, purchase, product, price }, p7.offset_from(p) as usize))
+        // Field ends first, then each field on its own (independent work).
+        let e = split::<7>(p)?;
+        let eid = key_at(p, 0, e[0]);
+        let user = key_at(p, e[0] + 1, e[1]);
+        let t = ts_at(p, e[1] + 1, e[2], y);
+        let ingest = ts_at(p, e[2] + 1, e[3], y);
+        let purchase = type_at(p, e[3] + 1, e[4]);
+        let product = key_at(p, e[4] + 1, e[5]);
+        let price = digits_at(p, e[5] + 1, e[6]);
+        let ev = Event { eid: eid?, user: user?, t: t?, ingest: ingest?, purchase: purchase?, product: product?, price: price? };
+        Some((ev, e[6] + 1))
     }
     #[cfg(not(target_feature = "avx2"))]
     {
@@ -300,7 +326,7 @@ pub unsafe fn event(p: *const u8, y: &Years) -> Option<(Event, usize)> {
     }
 }
 
-/// The click line starting at `p` (SPAN bytes readable), like `event`.
+/// The click line starting at `p`, like `event`.
 ///
 /// # Safety
 /// `SPAN` bytes from `p` must be readable.
@@ -309,11 +335,12 @@ pub unsafe fn click(p: *const u8, y: &Years) -> Option<(Click, usize)> {
     #[cfg(target_feature = "avx2")]
     {
         use simd::*;
-        let (cid, p1) = key_field(p, b',')?;
-        let (user, p2) = key_field(p1, b',')?;
-        let (campaign, p3) = key_field(p2, b',')?;
-        let (t, p4) = ts_field(p3, b'\n', y)?;
-        Some((Click { cid, user, campaign, t }, p4.offset_from(p) as usize))
+        let e = split::<4>(p)?;
+        let cid = key_at(p, 0, e[0]);
+        let user = key_at(p, e[0] + 1, e[1]);
+        let campaign = key_at(p, e[1] + 1, e[2]);
+        let t = ts_at(p, e[2] + 1, e[3], y);
+        Some((Click { cid: cid?, user: user?, campaign: campaign?, t: t? }, e[3] + 1))
     }
     #[cfg(not(target_feature = "avx2"))]
     {
