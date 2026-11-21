@@ -673,7 +673,7 @@ fn main() {
     // Start reading every input range now, in the order the parsers will
     // want it, so the device queue stays full (cold page cache) while the
     // small files are read and the parsers run.
-    {
+    if input.needs_readahead() {
         let inp = input.clone();
         let order: Vec<(usize, usize, usize)> =
             ln_tasks.iter().chain(ck_tasks.iter()).chain(ev_tasks.iter()).copied().collect();

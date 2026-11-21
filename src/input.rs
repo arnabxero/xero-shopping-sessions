@@ -159,6 +159,12 @@ impl Input {
         (m, d, n)
     }
 
+    /// Whether any file is read with buffered reads (the only ones that
+    /// benefit from kernel readahead hints).
+    pub fn needs_readahead(&self) -> bool {
+        self.files.iter().any(|f| f.len > 0 && f.map.is_none() && f.direct.is_none())
+    }
+
     /// Share of the input bytes that are not memory-mapped (read by the workers).
     pub fn unmapped_share(&self) -> f64 {
         let total: usize = self.files.iter().map(|f| f.len).sum();
@@ -180,8 +186,8 @@ impl Input {
         let f = &self.files[fi];
         #[cfg(unix)]
         {
-            if let Some(m) = &f.map {
-                let _ = m.advise_range(memmap2::Advice::WillNeed, s, e - s);
+            if f.map.is_some() {
+                // Mapped files were found (almost) fully cached: nothing to read ahead.
             } else if f.direct.is_some() {
             } else if let Some(file) = &f.file {
                 use std::os::fd::AsRawFd;
