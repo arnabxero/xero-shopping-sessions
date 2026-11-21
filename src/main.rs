@@ -2,6 +2,7 @@
 //! README.md for the design.
 
 mod csv;
+mod input;
 mod keys;
 mod map;
 mod out;
@@ -9,15 +10,14 @@ mod scatter;
 mod ts;
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use memmap2::Mmap;
 
 use map::{mix, U64Map};
+use input::{ChunkBuf, Input};
 use scatter::Scatter;
 
 #[global_allocator]
@@ -197,20 +197,6 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn map_file(path: &Path) -> Option<Mmap> {
-    let f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len == 0 {
-        return None;
-    }
-    let m = unsafe { Mmap::map(&f).ok()? };
-    #[cfg(unix)]
-    {
-        let _ = m.advise(memmap2::Advice::Sequential);
-    }
-    Some(m)
-}
-
 /// Nominal byte ranges of a file, without touching its data (so no I/O
 /// happens before the readahead starts). `chunk_lines` turns a range into the
 /// lines that start in it.
@@ -220,26 +206,6 @@ fn chunks(len: usize, out: &mut Vec<(usize, usize)>) {
         let e = (s + CHUNK).min(len);
         out.push((s, e));
         s = e;
-    }
-}
-
-/// The data lines owned by the nominal range [s, e) of a file: those whose
-/// first byte lies in it, the header (the file's first line) excluded. The
-/// last one may run past e.
-fn chunk_lines(data: &[u8], s: usize, e: usize) -> &[u8] {
-    let after_nl = |from: usize| -> usize {
-        match csv::memchr_nl(&data[from..]) {
-            Some(i) => from + i + 1,
-            None => data.len(),
-        }
-    };
-    // The header ends the first line; otherwise a line starts right after a newline.
-    let p0 = if s == 0 { after_nl(0) } else { after_nl(s - 1) };
-    let p1 = if e >= data.len() { data.len() } else { after_nl(e - 1) };
-    if p0 < p1 {
-        &data[p0..p1]
-    } else {
-        &[]
     }
 }
 
@@ -590,14 +556,15 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: u64, evs: &[u64], cks: &[PCl
 }
 
 /// Time the pieces of event parsing separately (SHOPPING_PROFILE=1).
-fn profile(ctx: &Ctx, maps: &[Mmap], tasks: &[(usize, usize, usize)], threads: usize) {
+fn profile(ctx: &Ctx, input: &Input, tasks: &[(usize, usize, usize)], threads: usize) {
     let sink = AtomicUsize::new(0);
     let run = |name: &str, f: &(dyn Fn(&[u8]) -> usize + Sync)| {
         for _ in 0..2 {
             let t = Instant::now();
             par_tasks(threads, tasks.len(), |_, i| {
                 let (fi, s, e) = tasks[i];
-                sink.fetch_add(f(chunk_lines(&maps[fi], s, e)), Ordering::Relaxed);
+                let mut buf = ChunkBuf::default();
+                sink.fetch_add(f(input.lines(fi, s, e, &mut buf)), Ordering::Relaxed);
             });
             eprintln!("{name:>28}: {:8.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
@@ -681,33 +648,40 @@ fn main() {
     let ev_files = list_csv(&data_dir.join("events"));
     let ck_files = list_csv(&data_dir.join("clicks"));
     let ln_files = list_csv(&data_dir.join("links"));
-    let mut maps: Vec<Mmap> = Vec::new();
+    // SHOPPING_IO=mmap|pread forces a read mode; by default each file is
+    // mapped when its pages are already cached and read with pread otherwise.
+    let io_mode = match std::env::var("SHOPPING_IO").as_deref() {
+        Ok("mmap") => input::Mode::Mmap,
+        Ok("pread") => input::Mode::Pread,
+        _ => input::Mode::Auto,
+    };
     let mut ev_tasks: Vec<(usize, usize, usize)> = Vec::new();
     let mut ck_tasks: Vec<(usize, usize, usize)> = Vec::new();
     let mut ln_tasks: Vec<(usize, usize, usize)> = Vec::new();
-    for (files, tasks) in [(&ev_files, &mut ev_tasks), (&ck_files, &mut ck_tasks), (&ln_files, &mut ln_tasks)] {
-        for p in files.iter() {
-            if let Some(m) = map_file(p) {
-                let mut cs = Vec::new();
-                chunks(m.len(), &mut cs);
-                let fi = maps.len();
-                tasks.extend(cs.into_iter().map(|(s, e)| (fi, s, e)));
-                maps.push(m);
-            }
-        }
+    let all_files: Vec<PathBuf> = ev_files.iter().chain(ck_files.iter()).chain(ln_files.iter()).cloned().collect();
+    let input = std::sync::Arc::new(Input::open(&all_files, io_mode));
+    for (fi, _) in all_files.iter().enumerate() {
+        let tasks = if fi < ev_files.len() {
+            &mut ev_tasks
+        } else if fi < ev_files.len() + ck_files.len() {
+            &mut ck_tasks
+        } else {
+            &mut ln_tasks
+        };
+        let mut cs = Vec::new();
+        chunks(input.len(fi), &mut cs);
+        tasks.extend(cs.into_iter().map(|(s, e)| (fi, s, e)));
     }
     // Start reading every input range now, in the order the parsers will
     // want it, so the device queue stays full (cold page cache) while the
     // small files are read and the parsers run.
-    let maps = std::sync::Arc::new(maps);
-    #[cfg(unix)]
     {
-        let m = maps.clone();
+        let inp = input.clone();
         let order: Vec<(usize, usize, usize)> =
             ln_tasks.iter().chain(ck_tasks.iter()).chain(ev_tasks.iter()).copied().collect();
         std::thread::spawn(move || {
             for (fi, s, e) in order {
-                let _ = m[fi].advise_range(memmap2::Advice::WillNeed, s, e - s);
+                inp.prefetch(fi, s, e);
             }
         });
     }
@@ -786,7 +760,8 @@ fn main() {
         camp_channels,
     };
 
-    log(&format!("setup: {} event, {} click, {} link chunks", ev_tasks.len(), ck_tasks.len(), ln_tasks.len()), t0);
+    let (mapped, nfiles) = input.mapped();
+    log(&format!("setup: {} event, {} click, {} link chunks; {mapped}/{nfiles} files mapped", ev_tasks.len(), ck_tasks.len(), ln_tasks.len()), t0);
     // About 70 bytes per event line; aim for ~16k rows per partition.
     let ev_bytes: usize = ev_tasks.iter().map(|&(_, s, e)| e - s).sum();
     let est_rows = ev_bytes / 70 + 1;
@@ -797,7 +772,7 @@ fn main() {
     let nq = 1usize << qbits();
 
     if std::env::var_os("SHOPPING_PROFILE").is_some() {
-        profile(&ctx, &maps, &ev_tasks, threads);
+        profile(&ctx, &input, &ev_tasks, threads);
         return;
     }
 
@@ -806,7 +781,8 @@ fn main() {
     par_tasks(threads, ln_tasks.len(), |_, t| {
         let (fi, s, e) = ln_tasks[t];
         let mut v = Vec::new();
-        parse_links(chunk_lines(&maps[fi], s, e), &mut v);
+        let mut buf = ChunkBuf::default();
+        parse_links(input.lines(fi, s, e, &mut buf), &mut v);
         *link_out[t].lock().unwrap() = v;
     });
     let link_pairs: Vec<Vec<(u64, u64)>> = link_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
@@ -830,11 +806,12 @@ fn main() {
             *persons.lock().unwrap() = Some(m);
         });
         for w in 0..threads {
-            let (next, ctx, maps, ev_parts, ck_out, ck_tasks, ev_tasks) =
-                (&next, &ctx, &maps, &ev_parts, &ck_out, &ck_tasks, &ev_tasks);
+            let (next, ctx, input, ev_parts, ck_out, ck_tasks, ev_tasks) =
+                (&next, &ctx, &input, &ev_parts, &ck_out, &ck_tasks, &ev_tasks);
             s.spawn(move || {
                 let mut guard = ev_parts[w].lock().unwrap();
                 let parts = guard.insert(Scatter::new(np, per_part));
+                let mut buf = ChunkBuf::default();
                 loop {
                     let t = next.fetch_add(1, Ordering::Relaxed);
                     if t >= ntasks {
@@ -844,12 +821,12 @@ fn main() {
                     if t < ck_tasks.len() {
                         let (fi, s, e) = ck_tasks[t];
                         let mut v = Vec::with_capacity((e - s) / 40 + 16);
-                        parse_clicks(ctx, chunk_lines(&maps[fi], s, e), &mut v);
+                        parse_clicks(ctx, input.lines(fi, s, e, &mut buf), &mut v);
                         *ck_out[t].lock().unwrap() = v;
                         tadd(6, tm);
                     } else {
                         let (fi, s, e) = ev_tasks[t - ck_tasks.len()];
-                        parse_events(ctx, chunk_lines(&maps[fi], s, e), parts);
+                        parse_events(ctx, input.lines(fi, s, e, &mut buf), parts);
                         tadd(5, tm);
                     }
                 }
@@ -860,7 +837,7 @@ fn main() {
     keys::freeze();
     // Nothing refers to the input mappings any more: unmap them off the
     // critical path instead of at process exit.
-    std::thread::spawn(move || drop(maps));
+    std::thread::spawn(move || drop(input));
     log("events/clicks parsed, persons built", t0);
     if std::env::var_os("SHOPPING_DEBUG").is_some() {
         eprintln!("phase1 thread-ms: events {:.0} clicks {:.0} persons {:.0}",
