@@ -898,23 +898,31 @@ fn main() {
             let cap = (2 * n).next_power_of_two();
             let mask = cap - 1;
             let tm = Tm::now();
-            let mut table: Vec<u32> = vec![u32::MAX; cap];
+            // Entries are fingerprint << 32 | row id, so a probe reads a row only
+            // when the 32-bit fingerprints match (row ids never reach u32::MAX).
+            const EMPTY: u64 = u64::MAX;
+            let mut table: Vec<u64> = vec![EMPTY; cap];
             for (wi, src) in srcs.iter().enumerate() {
                 for (i, r) in src.iter().enumerate() {
                     let id = ((wi as u32) << WSHIFT) | i as u32;
-                    let mut s = mix(r.eid) as usize & mask;
+                    let h = mix(r.eid);
+                    let fp = (h >> 16) as u32;
+                    let entry = (fp as u64) << 32 | id as u64;
+                    let mut s = h as usize & mask;
                     loop {
-                        let x = table[s];
-                        if x == u32::MAX {
-                            table[s] = id;
+                        let e = table[s];
+                        if e == EMPTY {
+                            table[s] = entry;
                             break;
                         }
-                        let o = row(x);
-                        if o.eid == r.eid {
-                            if r.ingest < o.ingest {
-                                table[s] = id;
+                        if (e >> 32) as u32 == fp {
+                            let o = row(e as u32);
+                            if o.eid == r.eid {
+                                if r.ingest < o.ingest {
+                                    table[s] = entry;
+                                }
+                                break;
                             }
-                            break;
                         }
                         s = (s + 1) & mask;
                     }
@@ -931,23 +939,41 @@ fn main() {
                 let person = person_of(r.user);
                 out.push((mix(person) >> qshift) as usize, PRec { person, tspc: ((r.ts as u64) << 32) | r.pc as u64 });
             };
+            // Winners are found walking the rows in memory order: a valid row is
+            // its event's kept copy when the table entry for its event_id holds
+            // its own id.
             let mut ring = [0u32; 16];
             let mut n_in = 0usize;
-            for &x in &table {
-                if x == u32::MAX {
-                    continue;
+            for (wi, src) in srcs.iter().enumerate() {
+                for (i, r) in src.iter().enumerate() {
+                    if r.pc == INVALID {
+                        continue;
+                    }
+                    let x = ((wi as u32) << WSHIFT) | i as u32;
+                    let h = mix(r.eid);
+                    let fp = (h >> 16) as u32;
+                    let mut s = h as usize & mask;
+                    let winner = loop {
+                        let e = table[s];
+                        if e as u32 == x {
+                            break true;
+                        }
+                        if (e >> 32) as u32 == fp && row(e as u32).eid == r.eid {
+                            break false;
+                        }
+                        s = (s + 1) & mask;
+                    };
+                    if !winner {
+                        continue;
+                    }
+                    persons.prefetch(r.user);
+                    let slot = n_in & 15;
+                    if n_in >= 16 {
+                        emit(ring[slot]);
+                    }
+                    ring[slot] = x;
+                    n_in += 1;
                 }
-                let r = row(x);
-                if r.pc == INVALID {
-                    continue;
-                }
-                persons.prefetch(r.user);
-                let slot = n_in & 15;
-                if n_in >= 16 {
-                    emit(ring[slot]);
-                }
-                ring[slot] = x;
-                n_in += 1;
             }
             for j in n_in.saturating_sub(16)..n_in {
                 emit(ring[j & 15]);
