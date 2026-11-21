@@ -283,11 +283,12 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     let shift = 64 - pbits();
+    let mut dc = ts::DateCache::new();
     csv::for_each_line::<7, 128, _>(data, |f| {
         if f[0].is_empty() {
             return;
         }
-        let ingest = ts::parse(f[3]);
+        let ingest = ts::parse_cached(f[3], &mut dc);
         if ingest == ts::BAD {
             return;
         }
@@ -299,7 +300,7 @@ fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let t = ts::parse(f[2]);
+            let t = ts::parse_cached(f[2], &mut dc);
             if t < ws || t >= we {
                 break 'v;
             }

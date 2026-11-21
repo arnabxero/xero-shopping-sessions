@@ -185,6 +185,98 @@ fn f1(s: &[u8]) -> i64 {
     (days * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000
 }
 
+/// Days since the epoch of a valid `YYYY-MM-DD` in the first 10 bytes, or None.
+#[inline(always)]
+fn date_days(s: &[u8]) -> Option<i64> {
+    let lo = u64::from_le_bytes(s[0..8].try_into().unwrap()); // YYYY-MM-
+    let dd = u16::from_le_bytes(s[8..10].try_into().unwrap()) as u64; // DD
+    const LO_SEP_M: u64 = 0xFF00_00FF_0000_0000;
+    const LO_SEP: u64 = 0x2D00_002D_0000_0000;
+    const LO_D: u64 = 0x00FF_FF00_FFFF_FFFF;
+    if (lo & LO_SEP_M) != LO_SEP || !swar_digits(lo, LO_D) || !swar_digits(dd, 0xFFFF) {
+        return None;
+    }
+    const Z: u64 = 0x3030_3030_3030_3030;
+    let dl = (lo & LO_D) - (Z & LO_D);
+    let tl = dl * 10 + (dl >> 8);
+    let year = ((tl & 0xFF) * 100 + ((tl >> 16) & 0xFF)) as u32;
+    let month = ((tl >> 40) & 0xFF) as u32;
+    let dd = dd - 0x3030;
+    let day = ((dd & 0xFF) * 10 + (dd >> 8)) as u32;
+    if month.wrapping_sub(1) >= 12 {
+        return None;
+    }
+    let yi = year.wrapping_sub(Y0) as usize;
+    if yi < NY {
+        let idx = yi * 12 + (month - 1) as usize;
+        if day.wrapping_sub(1) >= MONTHS.1[idx] as u32 {
+            return None;
+        }
+        Some(MONTHS.0[idx] as i64 + day as i64 - 1)
+    } else {
+        if day < 1 || day > days_in_month(year, month) {
+            return None;
+        }
+        Some(days_from_civil(year as i64, month as i64, day as i64))
+    }
+}
+
+/// Recently seen valid dates (first 10 bytes of an F1 timestamp) and their
+/// day numbers. Timestamps cluster on a few dates, so most F1 parses only
+/// decode `HH:MM:SS`.
+pub struct DateCache {
+    slots: [(u64, u16, i64); 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        DateCache { slots: [(0, 0, 0); 64] }
+    }
+}
+
+/// `parse`, with F1 dates looked up in `dc`.
+#[inline(always)]
+pub fn parse_cached(s: &[u8], dc: &mut DateCache) -> i64 {
+    if s.len() == 20 && s[19] == b'Z' {
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u16::from_le_bytes(s[8..10].try_into().unwrap());
+        let idx = (((a >> 40) as usize).wrapping_mul(31) ^ (b as usize).wrapping_mul(7)) & 63;
+        let slot = &mut dc.slots[idx];
+        let days = if slot.0 == a && slot.1 == b {
+            slot.2
+        } else {
+            match date_days(s) {
+                Some(d) => {
+                    *slot = (a, b, d);
+                    d
+                }
+                None => return BAD,
+            }
+        };
+        // "THH:MM:SS" at 10..19 ('Z' at 19 checked above).
+        if s[10] != b'T' {
+            return BAD;
+        }
+        let t = u64::from_le_bytes(s[11..19].try_into().unwrap()); // HH:MM:SS
+        const SEP_M: u64 = 0x0000_FF00_00FF_0000;
+        const SEP: u64 = 0x0000_3A00_003A_0000;
+        const D: u64 = 0xFFFF_00FF_FF00_FFFF;
+        if (t & SEP_M) != SEP || !swar_digits(t, D) {
+            return BAD;
+        }
+        let d = (t & D) - (0x3030_3030_3030_3030 & D);
+        let tt = d * 10 + (d >> 8);
+        let hour = (tt & 0xFF) as u32;
+        let minute = ((tt >> 24) & 0xFF) as u32;
+        let second = ((tt >> 48) & 0xFF) as u32;
+        if hour > 23 || minute > 59 || second > 59 {
+            return BAD;
+        }
+        return (days * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000;
+    }
+    parse(s)
+}
+
 #[inline(always)]
 pub fn parse(s: &[u8]) -> i64 {
     let n = s.len();
@@ -364,6 +456,34 @@ mod tests {
                     assert_eq!(p(&text), want, "{text}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cached_matches_parse() {
+        let mut dc = DateCache::new();
+        let mut check = |t: &[u8]| assert_eq!(parse_cached(t, &mut dc), parse(t), "{:?}", String::from_utf8_lossy(t));
+        for y in [1899u32, 1970, 2025, 2026, 2027, 2028, 2199, 2200, 9999] {
+            for m in 0..=13u32 {
+                for d in 0..=32u32 {
+                    for (h, mi, se) in [(0u32, 0u32, 0u32), (23, 59, 59), (24, 0, 0), (12, 60, 1), (1, 2, 60), (9, 9, 9)] {
+                        check(format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{se:02}Z").as_bytes());
+                    }
+                }
+            }
+        }
+        for base in ["2026-10-03T23:58:10Z", "2028-02-29T00:00:00Z"] {
+            for i in 0..19 {
+                for v in 0..=255u8 {
+                    let mut t = base.as_bytes().to_vec();
+                    t[i] = v;
+                    check(&t);
+                    check(base.as_bytes());
+                }
+            }
+        }
+        for s in ["1791071890000", "", "2026-10-03T19:58:10-04:00", "00000001791071890000"] {
+            check(s.as_bytes());
         }
     }
 
