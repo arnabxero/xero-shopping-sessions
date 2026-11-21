@@ -1,0 +1,11 @@
+target/
+dev/
+data/
+out/
+out-*/
+outputs/
+*.parquet
+!fixtures/**
+__pycache__/
+*.pyc
+.env
