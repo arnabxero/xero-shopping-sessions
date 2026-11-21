@@ -2,6 +2,7 @@
 //! README.md for the design.
 
 mod csv;
+mod fastline;
 mod input;
 mod keys;
 mod map;
@@ -31,6 +32,8 @@ const LATE: i64 = 86_400_000;
 /// `pc` of an event row that fails validation.
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = 0x00FF_FFFF;
+/// The largest valid price in cents.
+const PRICE_MAX: u64 = 10_000_000;
 
 /// Bits of the partition counts (by event_id for dedup, by person for
 /// sessions), chosen from the input size so partitions stay cache-sized.
@@ -50,7 +53,7 @@ fn qbits() -> u32 {
 const CHUNK: usize = 2 << 20;
 
 /// One parsed event line, routed by the hash of its event_id.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
 struct ERec {
     eid: u64,
@@ -63,7 +66,7 @@ struct ERec {
 }
 
 /// One valid click.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
 struct CRec {
     user: u64,
@@ -108,6 +111,10 @@ struct Ctx {
     camp_other: HashMap<Vec<u8>, u32>,
     camp_ids: Vec<Vec<u8>>,
     camp_channels: Vec<Vec<u8>>,
+    /// Years the line fast path decodes dates in, and whether it is on
+    /// (SHOPPING_FAST=0 turns it off).
+    years: fastline::Years,
+    fast: bool,
 }
 
 impl Ctx {
@@ -118,6 +125,12 @@ impl Ctx {
             None => self.prod_other.get(product).copied(),
         };
         found.unwrap_or(self.unknown_cat)
+    }
+
+    /// `category` of a product whose ID packs to `k`.
+    #[inline(always)]
+    fn product_category(&self, k: u64) -> u32 {
+        self.prod_packed.get(k).unwrap_or(self.unknown_cat)
     }
 
     #[inline(always)]
@@ -270,7 +283,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
             return None;
         }
         v = v * 10 + d as u64;
-        if v > 10_000_000 {
+        if v > PRICE_MAX {
             return None;
         }
     }
@@ -281,63 +294,153 @@ fn parse_price(s: &[u8]) -> Option<u32> {
     }
 }
 
+/// The record of an event line's fields (general path), or None when the
+/// line is skipped.
+#[inline(always)]
+fn event_rec(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut ts::DateCache) -> Option<ERec> {
+    if f[0].is_empty() {
+        return None;
+    }
+    let ingest = ts::parse_cached(f[3], dc);
+    if ingest == ts::BAD {
+        return None;
+    }
+    // Readable bytes end at the line end at the latest (the last field's end).
+    let end = f[6].as_ptr().wrapping_add(f[6].len());
+    let eid = keys::key_bounded(f[0], end);
+    let mut rec = ERec { eid, ingest, user: 0, ts: 0, pc: INVALID };
+    'v: {
+        if f[1].is_empty() || f[5].is_empty() {
+            break 'v;
+        }
+        let t = ts::parse_cached(f[2], dc);
+        if t < ctx.ws || t >= ctx.we {
+            break 'v;
+        }
+        if ingest.saturating_sub(t) > LATE {
+            break 'v;
+        }
+        let pc = match f[4] {
+            b"view" | b"cart" => 0,
+            b"purchase" => {
+                let Some(price) = parse_price(f[6]) else { break 'v };
+                price | (ctx.category(f[5]) << 24)
+            }
+            _ => break 'v,
+        };
+        rec.user = keys::key_bounded(f[1], end);
+        rec.ts = (t - ctx.base) as u32;
+        rec.pc = pc;
+    }
+    Some(rec)
+}
+
+/// The record of a fast-path event line: the checks of event_rec, on the
+/// same values.
+#[inline(always)]
+fn fast_event_rec(ctx: &Ctx, e: &fastline::Event) -> ERec {
+    let valid = e.t >= ctx.ws
+        && e.t < ctx.we
+        && e.ingest.saturating_sub(e.t) <= LATE
+        && (!e.purchase || (1..=PRICE_MAX).contains(&e.price));
+    if valid {
+        let pc = if e.purchase { e.price as u32 | (ctx.product_category(e.product) << 24) } else { 0 };
+        ERec { eid: e.eid, ingest: e.ingest, user: e.user, ts: (e.t - ctx.base) as u32, pc }
+    } else {
+        ERec { eid: e.eid, ingest: e.ingest, user: 0, ts: 0, pc: INVALID }
+    }
+}
+
 fn parse_events(ctx: &Ctx, data: &[u8], parts: &mut Scatter<ERec>) {
-    let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     let shift = 64 - pbits();
     let mut dc = ts::DateCache::new();
-    csv::for_each_line::<7, 128, _>(data, |f| {
-        if f[0].is_empty() {
-            return;
-        }
-        let ingest = ts::parse_cached(f[3], &mut dc);
-        if ingest == ts::BAD {
-            return;
-        }
-        // Readable bytes end at the line end at the latest (the last field's end).
-        let end = f[6].as_ptr().wrapping_add(f[6].len());
-        let eid = keys::key_bounded(f[0], end);
-        let mut rec = ERec { eid, ingest, user: 0, ts: 0, pc: INVALID };
-        'v: {
-            if f[1].is_empty() || f[5].is_empty() {
-                break 'v;
-            }
-            let t = ts::parse_cached(f[2], &mut dc);
-            if t < ws || t >= we {
-                break 'v;
-            }
-            if ingest.saturating_sub(t) > LATE {
-                break 'v;
-            }
-            let pc = match f[4] {
-                b"view" | b"cart" => 0,
-                b"purchase" => {
-                    let Some(price) = parse_price(f[6]) else { break 'v };
-                    price | (ctx.category(f[5]) << 24)
+    let mut pos = 0usize;
+    if ctx.fast {
+        // Lines of the common shape in one pass each (fastline.rs); any
+        // other line, and the last lines of the chunk, the general way.
+        let len = data.len();
+        let p0 = data.as_ptr();
+        while pos + fastline::SPAN <= len {
+            if let Some((e, n)) = unsafe { fastline::event(p0.add(pos), &ctx.years) } {
+                pos += n;
+                let rec = fast_event_rec(ctx, &e);
+                parts.push((mix(rec.eid) >> shift) as usize, rec);
+            } else {
+                let end = csv::memchr_nl(&data[pos..]).map_or(len, |i| pos + i);
+                if let Some(f) = csv::split::<7>(&data[pos..end]) {
+                    if let Some(rec) = event_rec(ctx, &f, &mut dc) {
+                        parts.push((mix(rec.eid) >> shift) as usize, rec);
+                    }
                 }
-                _ => break 'v,
-            };
-            rec.user = keys::key_bounded(f[1], end);
-            rec.ts = (t - base) as u32;
-            rec.pc = pc;
+                pos = end + 1;
+            }
         }
-        parts.push((mix(eid) >> shift) as usize, rec);
-    });
+    }
+    if pos < data.len() {
+        csv::for_each_line::<7, 128, _>(&data[pos..], |f| {
+            if let Some(rec) = event_rec(ctx, f, &mut dc) {
+                parts.push((mix(rec.eid) >> shift) as usize, rec);
+            }
+        });
+    }
+}
+
+/// The record of a click line's fields (general path), or None when the
+/// click is skipped.
+#[inline(always)]
+fn click_rec(ctx: &Ctx, f: &[&[u8]; 4]) -> Option<CRec> {
+    if f[0].is_empty() || f[1].is_empty() {
+        return None;
+    }
+    let t = ts::parse(f[3]);
+    if t < ctx.base || t >= ctx.we {
+        return None;
+    }
+    let camp = ctx.campaign(f[2])?;
+    let end = f[3].as_ptr().wrapping_add(f[3].len());
+    Some(CRec { user: keys::key_bounded(f[1], end), cid: keys::key_bounded(f[0], end), ts: (t - ctx.base) as u32, camp })
+}
+
+/// The record of a fast-path click line: the checks of click_rec, on the
+/// same values.
+#[inline(always)]
+fn fast_click_rec(ctx: &Ctx, c: &fastline::Click) -> Option<CRec> {
+    if c.t < ctx.base || c.t >= ctx.we {
+        return None;
+    }
+    let camp = ctx.camp_packed.get(c.campaign)?;
+    Some(CRec { user: c.user, cid: c.cid, ts: (c.t - ctx.base) as u32, camp })
 }
 
 fn parse_clicks(ctx: &Ctx, data: &[u8], out: &mut Vec<CRec>) {
-    let (base, we) = (ctx.base, ctx.we);
-    csv::for_each_line::<4, 64, _>(data, |f| {
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
+    let mut pos = 0usize;
+    if ctx.fast {
+        let len = data.len();
+        let p0 = data.as_ptr();
+        while pos + fastline::SPAN <= len {
+            if let Some((c, n)) = unsafe { fastline::click(p0.add(pos), &ctx.years) } {
+                pos += n;
+                if let Some(rec) = fast_click_rec(ctx, &c) {
+                    out.push(rec);
+                }
+            } else {
+                let end = csv::memchr_nl(&data[pos..]).map_or(len, |i| pos + i);
+                if let Some(f) = csv::split::<4>(&data[pos..end]) {
+                    if let Some(rec) = click_rec(ctx, &f) {
+                        out.push(rec);
+                    }
+                }
+                pos = end + 1;
+            }
         }
-        let t = ts::parse(f[3]);
-        if t < base || t >= we {
-            return;
-        }
-        let Some(camp) = ctx.campaign(f[2]) else { return };
-        let end = f[3].as_ptr().wrapping_add(f[3].len());
-        out.push(CRec { user: keys::key_bounded(f[1], end), cid: keys::key_bounded(f[0], end), ts: (t - base) as u32, camp });
-    });
+    }
+    if pos < data.len() {
+        csv::for_each_line::<4, 64, _>(&data[pos..], |f| {
+            if let Some(rec) = click_rec(ctx, f) {
+                out.push(rec);
+            }
+        });
+    }
 }
 
 fn parse_links(data: &[u8], out: &mut Vec<(u64, u64)>) {
@@ -560,6 +663,57 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: u64, evs: &[u64], cks: &[PCl
     agg.active.clear();
 }
 
+/// SHOPPING_VERIFY=1: read every event and click line that the line fast path
+/// can see both ways (fast path and general path) and stop at the first line
+/// where they differ. Writes no output.
+fn verify_fast(ctx: &Ctx, input: &Input, ev_tasks: &[(usize, usize, usize)], ck_tasks: &[(usize, usize, usize)], threads: usize) {
+    let counts: [AtomicUsize; 4] = Default::default();
+    let tasks: Vec<(bool, (usize, usize, usize))> =
+        ev_tasks.iter().map(|&t| (true, t)).chain(ck_tasks.iter().map(|&t| (false, t))).collect();
+    par_tasks(threads, tasks.len(), |_, i| {
+        let (is_ev, (fi, s, e)) = tasks[i];
+        let mut buf = ChunkBuf::default();
+        let data = input.lines(fi, s, e, &mut buf);
+        let mut dc = ts::DateCache::new();
+        let (mut fast, mut total) = (0usize, 0usize);
+        let mut pos = 0;
+        while pos < data.len() {
+            let end = csv::memchr_nl(&data[pos..]).map_or(data.len(), |i| pos + i);
+            let line = &data[pos..end];
+            total += 1;
+            if pos + fastline::SPAN <= data.len() {
+                let p = unsafe { data.as_ptr().add(pos) };
+                let same = if is_ev {
+                    match unsafe { fastline::event(p, &ctx.years) } {
+                        Some((ev, n)) => {
+                            fast += 1;
+                            let slow = csv::split::<7>(line).and_then(|f| event_rec(ctx, &f, &mut dc));
+                            n == line.len() + 1 && slow == Some(fast_event_rec(ctx, &ev))
+                        }
+                        None => true,
+                    }
+                } else {
+                    match unsafe { fastline::click(p, &ctx.years) } {
+                        Some((c, n)) => {
+                            fast += 1;
+                            let slow = csv::split::<4>(line).and_then(|f| click_rec(ctx, &f));
+                            n == line.len() + 1 && slow == fast_click_rec(ctx, &c)
+                        }
+                        None => true,
+                    }
+                };
+                assert!(same, "fast path differs on line {:?}", String::from_utf8_lossy(line));
+            }
+            pos = end + 1;
+        }
+        let k = if is_ev { 0 } else { 2 };
+        counts[k].fetch_add(fast, Ordering::Relaxed);
+        counts[k + 1].fetch_add(total, Ordering::Relaxed);
+    });
+    let c: Vec<usize> = counts.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+    eprintln!("verify: fast path took {} of {} event lines and {} of {} click lines; all agree with the general path", c[0], c[1], c[2], c[3]);
+}
+
 /// Time the pieces of event parsing separately (SHOPPING_PROFILE=1).
 /// Time pieces of event parsing (SHOPPING_PROFILE=<variant>, one pass;
 /// SHOPPING_PROFILE=all runs every variant twice). Use with perf stat to get
@@ -756,6 +910,8 @@ fn main() {
         camp_other,
         camp_ids,
         camp_channels,
+        years: fastline::Years::new(base - DAY, we + 6 * DAY),
+        fast: std::env::var("SHOPPING_FAST").as_deref() != Ok("0"),
     };
 
     let (mapped, direct, nfiles) = input.counts();
@@ -790,6 +946,10 @@ fn main() {
 
     if std::env::var_os("SHOPPING_PROFILE").is_some() {
         profile(&ctx, &input, &ev_tasks, threads);
+        return;
+    }
+    if std::env::var_os("SHOPPING_VERIFY").is_some() {
+        verify_fast(&ctx, &input, &ev_tasks, &ck_tasks, threads);
         return;
     }
 

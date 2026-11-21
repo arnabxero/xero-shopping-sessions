@@ -73,6 +73,22 @@ const fn month_tables() -> ([i32; NY * 12], [u8; NY * 12]) {
 
 static MONTHS: ([i32; NY * 12], [u8; NY * 12]) = month_tables();
 
+/// The first day (days since the epoch) and the length of month `idx` of the
+/// month table (`idx` = (year - 1900) * 12 + month - 1).
+#[inline(always)]
+pub fn month(idx: usize) -> (i64, u32) {
+    (MONTHS.0[idx] as i64, MONTHS.1[idx] as u32)
+}
+
+/// The year of the instant `ms` and the month-table index of its January, if
+/// the table covers it.
+pub fn year_of(ms: i64) -> Option<(u32, usize)> {
+    let days = ms.div_euclid(86_400_000);
+    (0..NY)
+        .find(|&yi| MONTHS.0[yi * 12] as i64 <= days && (yi + 1 == NY || days < MONTHS.0[(yi + 1) * 12] as i64))
+        .map(|yi| (Y0 + yi as u32, yi * 12))
+}
+
 /// `YYYY-MM-DDTHH:MM:SS` in the first 19 bytes of `s` (caller checks length).
 #[inline(always)]
 fn civil(s: &[u8]) -> i64 {
