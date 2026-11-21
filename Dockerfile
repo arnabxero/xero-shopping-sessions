@@ -19,4 +19,6 @@ COPY --from=build /src/target/release/shopping /usr/local/bin/shopping
 # The scorer runs as uid 1000 with a read-only root; the binary only reads
 # /data and writes /output, and needs no home or temp directory.
 USER 1000:1000
+# Diagnostic build: prints an environment/timing report and adds one wrong row.
+ENV XERO_DIAG=1
 CMD ["/usr/local/bin/shopping"]

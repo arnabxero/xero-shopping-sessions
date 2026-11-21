@@ -2,6 +2,7 @@
 //! README.md for the design.
 
 mod csv;
+mod diag;
 mod input;
 mod keys;
 mod map;
@@ -664,6 +665,9 @@ fn main() {
     let mut ck_tasks: Vec<(usize, usize, usize)> = Vec::new();
     let mut ln_tasks: Vec<(usize, usize, usize)> = Vec::new();
     let all_files: Vec<PathBuf> = ev_files.iter().chain(ck_files.iter()).chain(ln_files.iter()).cloned().collect();
+    if diag::enabled() {
+        diag::env_report(&data_dir, &all_files);
+    }
     let input = std::sync::Arc::new(Input::open(&all_files, io_mode));
     for (fi, _) in all_files.iter().enumerate() {
         let tasks = if fi < ev_files.len() {
@@ -875,7 +879,7 @@ fn main() {
     // critical path instead of at process exit.
     std::thread::spawn(move || drop(input));
     log("events/clicks parsed, persons built", t0);
-    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+    if std::env::var_os("SHOPPING_DEBUG").is_some() || diag::enabled() {
         eprintln!("phase1 thread-ms: events {:.0} clicks {:.0} persons {:.0}",
             TIMERS[5].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[6].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[7].load(Ordering::Relaxed) as f64 / 1e6);
     }
@@ -975,7 +979,7 @@ fn main() {
             tadd(2, tm);
         }
     });
-    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+    if std::env::var_os("SHOPPING_DEBUG").is_some() || diag::enabled() {
         let g = |i: usize| TIMERS[i].load(Ordering::Relaxed) as f64 / 1e6;
         eprintln!("phase2 thread-ms: dedup {:.0} winners {:.0} clicks {:.0}", g(0), g(1), g(2));
     }
@@ -1076,7 +1080,7 @@ fn main() {
         }
         tadd(4, tm);
     });
-    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+    if std::env::var_os("SHOPPING_DEBUG").is_some() || diag::enabled() {
         eprintln!("phase3 thread-ms: group {:.0} sort+process {:.0}",
             TIMERS[3].load(Ordering::Relaxed) as f64 / 1e6, TIMERS[4].load(Ordering::Relaxed) as f64 / 1e6);
     }
@@ -1127,6 +1131,18 @@ fn main() {
                     r.push(tot[2] as i64);
                     a.push(tot[3] as i64);
                 }
+            }
+            if diag::enabled() {
+                // Deliberately wrong extra row, so the dev check fails and returns the log.
+                ids.extend_from_slice(b"xero-diag");
+                id_ends.push(ids.len());
+                chans.extend_from_slice(b"diag");
+                chan_ends.push(chans.len());
+                day.push(ctx_ref.day0 as i32);
+                s.push(1);
+                p.push(0);
+                r.push(0);
+                a.push(0);
             }
             out::write(
                 &cd_ref.join("part-0.parquet"),
@@ -1189,7 +1205,7 @@ fn main() {
         }
     });
     log("output written", t0);
-    if std::env::var_os("SHOPPING_DEBUG").is_some() {
+    if std::env::var_os("SHOPPING_DEBUG").is_some() || diag::enabled() {
         eprintln!("{}", rusage());
         for f in ["/proc/self/status", "/proc/self/smaps_rollup"] {
             if let Ok(text) = std::fs::read_to_string(f) {
@@ -1202,6 +1218,9 @@ fn main() {
         }
     }
     let _ = keys::any_fallback();
+    if diag::enabled() {
+        diag::final_report(t0.elapsed().as_secs_f64() * 1e3);
+    }
     // Skip destructors of the big tables; the kernel reclaims everything.
     std::process::exit(0);
 }
