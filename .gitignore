@@ -1,0 +1,6 @@
+.board/
+.venv/
+target/
+out/
+dev/
+__pycache__/
