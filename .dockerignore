@@ -1,0 +1,10 @@
+fixtures/
+dev/
+dev-answer/
+out/
+data/
+native/target/
+pipeline/
+scripts/
+*.md
+.git

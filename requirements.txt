@@ -1,0 +1,4 @@
+# Only for the DuckDB reference pipeline and the test scripts; the image needs none of these.
+duckdb==1.5.6
+numpy==2.5.3
+polars==2.1.0

@@ -1,0 +1,9 @@
+# data and outputs never go in Git
+/dev
+/dev-answer
+/out
+/data
+target/
+__pycache__/
+*.parquet
+.env

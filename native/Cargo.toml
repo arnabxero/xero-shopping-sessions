@@ -1,0 +1,20 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "shopping-sessions"
+path = "src/main.rs"
+
+# No dependencies: nothing to download at build time and nothing to pin but the toolchain.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+debug = false
+strip = true
